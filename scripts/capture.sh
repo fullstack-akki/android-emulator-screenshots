@@ -5,22 +5,38 @@
 # URL may also come from the CAPTURE_URL environment variable; default
 # is https://example.com.
 #
-# Why the verification exists: an earlier version of this workflow
-# went green while one screenshot was a completely black frame and
-# the other showed only a "Process system isn't responding" ANR
-# dialog. The emulator had booted, but no useful UI ever rendered,
-# and nothing checked. This script now:
-#   1. waits for a SETTLED boot (boot_completed + boot animation stopped
-#      + package manager answering), not just the first boot signal;
-#   2. keeps the display awake so a sleeping screen cannot produce a
-#      black frame;
-#   3. waits for the launcher, then for Chrome to actually be the
-#      foreground app, before screenshotting;
-#   4. dismisses an ANR dialog via its "Wait" button when one appears;
-#   5. pixel-checks every capture with scripts/frame_check.py (stdlib
-#      python3) and retries up to 5 times per shot, failing LOUDLY
-#      (exit 1) instead of uploading black frames, leaving the last
-#      failed frame as a diagnostic.
+# Why the verification exists — three green runs produced useless
+# frames, each exposing a new hole in the previous check:
+#   Run #2 (Nov 2026): 01-settled.png completely black; 02-scrolled.png
+#     an ANR dialog. Nothing checked the frames at all.
+#   Run #3 (Nov 2026, generic repo run #1 at 18:21 IST, and the twin
+#     KhetBook run 41830351860, 15m 21s): BOTH frames showed a
+#     "Process system isn't responding" ANR dialog over a BRIGHT
+#     screen — one over Chrome's new-tab page (the URL never
+#     rendered), one over the launcher home screen (Chrome had lost
+#     the foreground entirely). The pixel check passed both
+#     (nonblack 0.9993 and 0.5201) because it only rejects DARK
+#     frames, and the ANR check degraded to "unknown" when the
+#     UI-dump pull failed — and "unknown" was treated as "proceed".
+#     The dialog persisted for ~1 minute across a foreground change,
+#     so the Wait-tap dismissal never happened.
+#
+# This script now gates EVERY shot on all three of:
+#   A. Chrome is the foreground app (a launcher/home frame is a
+#      failure, not a screenshot). Re-asserted before every shot
+#      and every retry; a bounded re-fire of the VIEW intent
+#      recovers a lost foreground (max 1 re-fire per shot).
+#   B. ANR state is KNOWN and CLEAR. The dump is obtained by a
+#      3-method chain (stdout dump, file+cat, dumpsys focus) with
+#      stderr kept in the log. UNKNOWN rejects the frame — it never
+#      accepts. A Wait tap must be VERIFIED gone by a re-dump.
+#   C. The requested URL is actually in a Chrome tab, proven via
+#      Chrome DevTools (adb forward + /json). Required for shot 1
+#      and after any re-fire. A new-tab page can never pass.
+#   D. The frame is not (near-)black (pixel check, as before).
+# If any gate cannot be satisfied in 5 attempts, the script exits 1
+# (the workflow goes RED) and saves the last failed frame as a
+# diagnostic. A green run means real screenshots.
 #
 # The URL is passed as the first argument (or CAPTURE_URL); it is a
 # public page. Nothing is typed, nothing is submitted, no login.
@@ -40,6 +56,10 @@ for helper in "$FRAME_CHECK" "$ANR_CHECK"; do
 done
 command -v python3 >/dev/null 2>&1 || {
   echo "ERROR: python3 is required for the frame/ANR checks and was not found." >&2
+  exit 1
+}
+command -v curl >/dev/null 2>&1 || {
+  echo "ERROR: curl is required for the Chrome DevTools URL check and was not found." >&2
   exit 1
 }
 
@@ -135,75 +155,306 @@ wait_for_launcher() {
   sleep 30
 }
 
+# chrome_is_foreground: 0 when a com.android.chrome activity is the
+# resumed/focused activity, 1 otherwise (including dumpsys failure).
+# Only ever called in a condition, so its non-zero status is safe
+# under `set -e`.
+chrome_is_foreground() {
+  adb shell dumpsys activity activities 2>/dev/null \
+    | grep -E "mResumedActivity|mFocusedApp" \
+    | grep -q "com.android.chrome"
+}
+
 wait_for_chrome_foreground() {
   log "Waiting for Chrome to be the foreground app..."
   local waited=0
   while [ "$waited" -lt 90 ]; do
-    if adb shell dumpsys activity activities 2>/dev/null \
-        | grep -E "mResumedActivity|mFocusedApp" \
-        | grep -q "com.android.chrome"; then
+    if chrome_is_foreground; then
       log "Chrome foreground after ${waited}s"
       return 0
     fi
     sleep 5
     waited=$((waited + 5))
   done
-  log "WARN: Chrome not observed in the foreground in 90s; continuing anyway."
+  log "WARN: Chrome not observed in the foreground in 90s; continuing anyway (per-attempt gates re-check)."
   return 0
 }
 
-# If an "isn't responding" dialog is on screen, tap its "Wait" button.
-# Returns 0 when there is no dialog or the tap was sent, 1 when a dialog
-# is present but its Wait button could not be found. Never fatal: a
-# timeout or a missing dump is treated as "unknown", and the frame
-# pixel check remains the backstop.
-dismiss_anr_if_present() {
-  local dump="$OUT_DIR/.ui-dump.xml"
-  rm -f "$dump"
-  if ! run_with_timeout 45 adb shell uiautomator dump /sdcard/window_dump.xml \
-      >/dev/null 2>&1; then
-    log "WARN: uiautomator dump timed out; ANR state unknown."
-    return 0
+# check_anr_state: print exactly ONE token on stdout:
+#   NO_ANR | WAIT <x> <y> | ANR_NO_WAIT | UNKNOWN
+# Diagnostics go to stderr (never stdout, so the captured token stays
+# clean). Always exits 0; callers branch on the token. UNKNOWN means
+# every dump method failed to produce usable output — the caller must
+# REJECT the frame. It must never be treated as "no dialog".
+check_anr_state() {
+  local out err result win
+  out="$OUT_DIR/.anr-dump.xml"
+  err="$OUT_DIR/.anr-method.err"
+
+  # Method 1: uiautomator dump straight to stdout (no file, no pull).
+  # The old dump-to-file + adb pull path failed silently in run #3
+  # (no dump file, pull error, stderr discarded) — this method
+  # removes the file transfer entirely.
+  rm -f "$out" "$err"
+  if run_with_timeout 60 adb exec-out uiautomator dump /dev/tty >"$out" 2>"$err"; then
+    if [ -s "$out" ]; then
+      result="$(python3 "$ANR_CHECK" - <"$out" 2>/dev/null || true)"
+      case "$result" in
+        NO_ANR|WAIT*|ANR_NO_WAIT)
+          echo "$result"
+          return 0
+          ;;
+      esac
+      echo "[capture] WARN: ANR method 1 output unparsable; stderr: $(head -c 300 "$err" | tr '\n' ' ')" >&2
+    else
+      echo "[capture] WARN: ANR method 1 returned empty output; stderr: $(head -c 300 "$err" | tr '\n' ' ')" >&2
+    fi
+  else
+    echo "[capture] WARN: ANR method 1 (exec-out dump) failed/timed out; stderr: $(head -c 300 "$err" | tr '\n' ' ')" >&2
   fi
-  if ! run_with_timeout 30 adb pull /sdcard/window_dump.xml "$dump" \
-      >/dev/null 2>&1; then
-    log "WARN: could not pull the UI dump; ANR state unknown."
-    return 0
+
+  # Method 2: dump to a file on the device, read it back with `cat`
+  # through the normal adb shell channel. No `adb pull`: the pull
+  # was the step that failed in run #3.
+  rm -f "$out" "$err"
+  if run_with_timeout 60 adb shell uiautomator dump /sdcard/window_dump.xml >"$OUT_DIR/.anr-m2.log" 2>"$err"; then
+    if run_with_timeout 30 adb shell cat /sdcard/window_dump.xml >"$out" 2>"$err"; then
+      if [ -s "$out" ]; then
+        result="$(python3 "$ANR_CHECK" - <"$out" 2>/dev/null || true)"
+        case "$result" in
+          NO_ANR|WAIT*|ANR_NO_WAIT)
+            echo "$result"
+            return 0
+            ;;
+        esac
+        echo "[capture] WARN: ANR method 2 output unparsable." >&2
+      else
+        echo "[capture] WARN: ANR method 2 (cat) returned empty output." >&2
+      fi
+    else
+      echo "[capture] WARN: ANR method 2 (cat) failed/timed out; stderr: $(head -c 300 "$err" | tr '\n' ' ')" >&2
+    fi
+  else
+    echo "[capture] WARN: ANR method 2 (dump to file) failed/timed out; stderr: $(head -c 300 "$err" | tr '\n' ' ')" >&2
   fi
-  local result
-  result="$(python3 "$ANR_CHECK" "$dump" 2>/dev/null || echo "ANR_CHECK_ERROR")"
-  case "$result" in
-    NO_ANR*)
+
+  # Method 3: dumpsys window focus. The ANR/crash dialog is the
+  # focused window and its title carries "Application Error" or
+  # "Application Not Responding" — the exact pattern Chromium's
+  # device_utils.py uses to detect and dismiss crash dialogs
+  # (mCurrentFocus ... Application (Error|Not Responding): ...).
+  # This method cannot give Wait-button coordinates, so a hit
+  # reports ANR_NO_WAIT (reject + retry, no tap).
+  win=""
+  if win="$(run_with_timeout 60 adb shell dumpsys window windows 2>"$err")"; then
+    if [ -n "$win" ]; then
+      if printf '%s' "$win" | grep -Eq "mCurrentFocus.*Application (Error|Not Responding):"; then
+        echo "ANR_NO_WAIT"
+        return 0
+      fi
+      echo "NO_ANR"
       return 0
-      ;;
-    WAIT*)
-      local x y
-      set -- $result
-      x="$2"
-      y="$3"
-      log "ANR dialog found; tapping Wait at $x,$y."
-      adb shell input tap "$x" "$y" || true
-      sleep 10
+    fi
+    echo "[capture] WARN: ANR method 3 (dumpsys) returned empty output." >&2
+  else
+    echo "[capture] WARN: ANR method 3 (dumpsys) failed/timed out; stderr: $(head -c 300 "$err" | tr '\n' ' ')" >&2
+  fi
+
+  echo "UNKNOWN"
+  return 0
+}
+
+# ensure_no_anr: 0 only when the screen is PROVEN ANR-free. A Wait tap
+# is verified gone by an immediate re-dump; an unverified tap counts
+# for nothing. Up to 3 probes, then 1 (caller rejects the frame).
+ensure_no_anr() {
+  local probe=1 state="" x="" y=""
+  while [ "$probe" -le 3 ]; do
+    state="$(check_anr_state 2>"$OUT_DIR/.anr-state.err")"
+    cat "$OUT_DIR/.anr-state.err" 2>/dev/null || true
+    case "$state" in
+      NO_ANR)
+        log "ANR check: clear (probe $probe)."
+        return 0
+        ;;
+      WAIT*)
+        set -- $state
+        x="$2"
+        y="$3"
+        log "ANR dialog found; tapping Wait at $x,$y (probe $probe)."
+        adb shell input tap "$x" "$y" || true
+        sleep 10
+        state="$(check_anr_state 2>"$OUT_DIR/.anr-state.err")"
+        cat "$OUT_DIR/.anr-state.err" 2>/dev/null || true
+        if [ "$state" = "NO_ANR" ]; then
+          log "ANR dialog dismissed (verified by re-dump)."
+          return 0
+        fi
+        log "WARN: ANR dialog still present after Wait tap (state: $state)."
+        ;;
+      ANR_NO_WAIT)
+        log "WARN: ANR dialog present but no Wait button found (probe $probe)."
+        ;;
+      UNKNOWN)
+        log "WARN: ANR state UNKNOWN — all dump methods failed (probe $probe)."
+        ;;
+      *)
+        log "WARN: unexpected ANR state '$state' (probe $probe)."
+        ;;
+    esac
+    sleep 10
+    probe=$((probe + 1))
+  done
+  log "ERROR: could not establish an ANR-free screen after 3 probes (last: $state)."
+  return 1
+}
+
+# url_matches <tab-url>: 0 when the tab URL is the requested URL
+# (scheme-insensitive, trailing slash ignored, sub-path/query/
+# fragment allowed — redirects and tracking params must not fail it).
+url_matches() {
+  local tab="$1" norm_tab="" norm_url=""
+  norm_url="${URL#http://}"
+  norm_url="${norm_url#https://}"
+  norm_url="${norm_url%/}"
+  norm_tab="${tab#http://}"
+  norm_tab="${norm_tab#https://}"
+  norm_tab="${norm_tab%/}"
+  case "$norm_tab" in
+    "$norm_url"|"$norm_url"/*|"$norm_url"?*|"$norm_url"#*)
       return 0
       ;;
     *)
-      log "WARN: ANR dialog present but no Wait button found ($result)."
       return 1
       ;;
   esac
 }
 
-# capture_verified_frame <outfile> <label>
-# Screenshots until the pixel check passes, up to 5 attempts. On total
-# failure, exits 1 (the workflow must go RED, never green-with-black)
-# and leaves the last failed frame as a diagnostic.
+# verify_url_loaded: 0 = a Chrome page tab holds the requested URL;
+# 1 = DevTools reachable but no tab holds the URL; 2 = DevTools
+# unreachable. Uses the documented Chrome remote-debugging socket
+# (adb forward tcp:9222 localabstract:chrome_devtools_remote, then
+# http://127.0.0.1:9222/json). Probes up to 3 times internally
+# because navigation may still be in flight. Every observed tab URL
+# is logged. Callers must use `verify_url_loaded || rc=$?` (a
+# non-zero return under `set -e` exits the script otherwise).
+verify_url_loaded() {
+  local probe=1 json="" urls="" tab="" rc=2
+  if ! adb forward tcp:9222 localabstract:chrome_devtools_remote >"$OUT_DIR/.cdp-forward.log" 2>&1; then
+    log "WARN: adb forward for Chrome DevTools failed."
+    head -5 "$OUT_DIR/.cdp-forward.log" 2>/dev/null || true
+    return 2
+  fi
+  while [ "$probe" -le 3 ]; do
+    json="$(curl -s --max-time 10 "http://127.0.0.1:9222/json" 2>/dev/null || true)"
+    if [ -n "$json" ]; then
+      urls="$(printf '%s' "$json" | python3 -c '
+import sys, json
+try:
+    targets = json.load(sys.stdin)
+except Exception as exc:
+    print("JSON_ERROR: %s" % exc)
+    sys.exit(0)
+for t in targets:
+    if isinstance(t, dict) and t.get("type") == "page":
+        print(t.get("url", ""))
+' 2>/dev/null || true)"
+      if printf '%s' "$urls" | grep -q "JSON_ERROR"; then
+        log "WARN: DevTools /json unparsable (probe $probe): $urls"
+        rc=2
+      elif [ -z "$urls" ]; then
+        log "WARN: DevTools /json lists no page tabs (probe $probe)."
+        rc=2
+      else
+        log "DevTools page tabs (probe $probe): $(printf '%s' "$urls" | tr '\n' ' ' | head -c 400)"
+        rc=1
+        while IFS= read -r tab; do
+          [ -z "$tab" ] && continue
+          if url_matches "$tab"; then
+            log "URL verified in Chrome tab: $tab"
+            adb forward --remove tcp:9222 >/dev/null 2>&1 || true
+            return 0
+          fi
+        done <<<"$urls"
+      fi
+    else
+      log "WARN: DevTools /json empty (probe $probe)."
+      rc=2
+    fi
+    probe=$((probe + 1))
+    [ "$probe" -le 3 ] && sleep 10
+  done
+  adb forward --remove tcp:9222 >/dev/null 2>&1 || true
+  return "$rc"
+}
+
+refire_intent() {
+  log "Re-firing VIEW intent at $URL ..."
+  adb shell am start -a android.intent.action.VIEW -d "$URL" com.android.chrome || true
+  wait_for_chrome_foreground
+  sleep 15
+}
+
+do_swipe() {
+  log "Scrolling down once..."
+  adb shell input swipe 540 1600 540 700 300 || true
+  sleep 5
+}
+
+# capture_verified_frame <outfile> <label> <check_url: 0|1>
+# Gates, in order, on EVERY attempt: (A) Chrome foreground,
+# (B) ANR-free verified, (C) URL evidence when required (shot 1, and
+# after any re-fire), (D) pixel check. At most 1 intent re-fire per
+# shot. On total failure, exits 1 (workflow goes RED) and leaves the
+# last failed frame as a diagnostic.
 capture_verified_frame() {
-  local outfile="$1" label="$2"
+  local outfile="$1" label="$2" check_url="$3"
   local tmp="$OUT_DIR/.tmp-$label.png"
-  local attempt=1 check_output=""
+  local attempt=1 refired=0 need_url="$check_url" url_rc=0 check_output=""
   while [ "$attempt" -le 5 ]; do
     log "$label: attempt $attempt/5"
-    dismiss_anr_if_present || log "WARN: ANR dialog could not be dismissed; retrying after a wait."
+    # Gate A: Chrome must be the foreground app.
+    if ! chrome_is_foreground; then
+      log "WARN: Chrome is not the foreground app (attempt $attempt)."
+      if [ "$refired" -eq 0 ]; then
+        refire_intent
+        refired=1
+        need_url=1
+        if [ "$label" = "scrolled" ]; then do_swipe; fi
+        attempt=$((attempt + 1))
+        continue
+      fi
+      log "$label: REJECTED (Chrome not foreground after re-fire)."
+      sleep 15
+      attempt=$((attempt + 1))
+      continue
+    fi
+    # Gate B: ANR-free, verified.
+    if ! ensure_no_anr; then
+      log "$label: REJECTED (ANR state not clear)."
+      sleep 15
+      attempt=$((attempt + 1))
+      continue
+    fi
+    # Gate C: the tab must hold the requested URL.
+    if [ "$need_url" -eq 1 ]; then
+      url_rc=0
+      verify_url_loaded || url_rc=$?
+      if [ "$url_rc" -ne 0 ]; then
+        log "$label: REJECTED (URL not verified in a Chrome tab, rc=$url_rc)."
+        if [ "$refired" -eq 0 ]; then
+          refire_intent
+          refired=1
+          if [ "$label" = "scrolled" ]; then do_swipe; fi
+        fi
+        sleep 15
+        attempt=$((attempt + 1))
+        continue
+      fi
+      need_url=0
+      log "$label: URL evidence OK."
+    fi
+    # Gate D: pixel check (rejects dark/blank frames).
     rm -f "$tmp"
     adb exec-out screencap -p > "$tmp" || true
     if [ ! -s "$tmp" ]; then
@@ -222,9 +473,23 @@ capture_verified_frame() {
     sleep 15
     attempt=$((attempt + 1))
   done
-  cp "$tmp" "$OUT_DIR/00-last-failed-frame-$label.png" 2>/dev/null || true
+  if [ -s "$tmp" ]; then
+    cp "$tmp" "$OUT_DIR/00-last-failed-frame-$label.png" 2>/dev/null || true
+  else
+    # The gates rejected every attempt before any screencap ran (e.g.
+    # ANR state never became known) — capture the stuck screen itself
+    # as the diagnostic instead of saving nothing.
+    log "Capturing a diagnostic frame of the stuck screen..."
+    adb exec-out screencap -p > "$OUT_DIR/00-last-failed-frame-$label.png" || true
+    if [ ! -s "$OUT_DIR/00-last-failed-frame-$label.png" ]; then
+      rm -f "$OUT_DIR/00-last-failed-frame-$label.png" 2>/dev/null || true
+      log "WARN: diagnostic screencap was empty; no diagnostic frame saved."
+    fi
+  fi
   log "ERROR: could not capture a real $label frame after 5 attempts."
-  log "Diagnostic saved: 00-last-failed-frame-$label.png"
+  if [ -s "$OUT_DIR/00-last-failed-frame-$label.png" ]; then
+    log "Diagnostic saved: 00-last-failed-frame-$label.png"
+  fi
   return 1
 }
 
@@ -241,8 +506,12 @@ if ! adb shell pm list packages 2>/dev/null | grep -q "com.android.chrome"; then
 fi
 log "Chrome is present."
 
-log "Setting Chrome as the default browser (role holder)..."
-adb shell cmd role add-role-holder android.app.role.BROWSER com.android.chrome || true
+# NOTE: no `cmd role add-role-holder` step. It only sets the DEFAULT
+# browser for implicit intents; the VIEW intent below names
+# com.android.chrome explicitly, which bypasses default resolution
+# entirely. The role step added nothing and timed out
+# (java.util.concurrent.TimeoutException) on the starved 1-vCPU
+# system in run #3's log — removed as a failure point.
 
 log "Applying Chrome first-run-experience skip flags..."
 # Documented Chrome mechanism: flags in /data/local/tmp/chrome-command-line
@@ -257,13 +526,11 @@ wait_for_chrome_foreground
 log "Page settle: sleeping 45s for the page to render..."
 sleep 45
 
-capture_verified_frame "$OUT_DIR/01-settled.png" "settled"
+capture_verified_frame "$OUT_DIR/01-settled.png" "settled" 1
 
-log "Scrolling down once..."
-adb shell input swipe 540 1600 540 700 300 || true
-sleep 5
+do_swipe
 
-capture_verified_frame "$OUT_DIR/02-scrolled.png" "scrolled"
+capture_verified_frame "$OUT_DIR/02-scrolled.png" "scrolled" 0
 
 log "Screenshots (verified frames):"
 ls -la "$OUT_DIR"
