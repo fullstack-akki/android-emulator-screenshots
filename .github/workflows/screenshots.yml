@@ -1,39 +1,54 @@
 # Android emulator screenshots — any URL, GitHub Actions, no setup
 #
-# Boots a REAL Android emulator on a GitHub-hosted macOS runner, opens
+# Boots a REAL Android emulator on a GitHub-hosted Ubuntu runner, opens
 # mobile Chrome to the URL you choose, and uploads VERIFIED screenshots
 # as workflow artifacts. Manual trigger only (workflow_dispatch).
 # No login, no credentials, no data creation, no local Android Studio,
 # no Mac required on your side — GitHub's runners do the work.
 #
-# Hardened the hard way (Nov 2026): an earlier config went green while
-# uploading a completely black frame and an "isn't responding" dialog,
-# because nothing checked the frames. This workflow fails LOUDLY
-# instead: every frame is pixel-checked and retried, and the run goes
-# red rather than upload unusable screenshots. See README.md.
+# Hardened the hard way (Nov 2026): three configs went green while
+# uploading useless frames, because the checks had holes. This workflow
+# fails LOUDLY instead: every frame must pass foreground + ANR + URL +
+# pixel gates, and the run goes red rather than upload unusable
+# screenshots. See README.md.
 #
-# Design notes (verified against live sources, Nov 2026):
-# - Runner is macos-15-intel (4-core Intel, 14 GB RAM), NOT macos-15
-#   (ARM). ARM macOS runners cannot run the Android emulator: nested
-#   virtualization is unavailable and Hypervisor.Framework returns
-#   HV_UNSUPPORTED, so the emulator never finishes booting
-#   (ReactiveCircus/android-emulator-runner#350). Intel runners are
-#   bare-metal Macs where hardware acceleration works.
+# Design notes (verified against live sources, Nov 2026; CORRECTED
+# after run #3 — see README "How this was hardened"):
+# - Runner is ubuntu-24.04 (4 vCPU, 16 GB RAM, standard GitHub-hosted
+#   runner), NOT macos-15-intel. macOS Intel runners are 4-core Macs,
+#   and the emulator glue pins x86_64 guests to ONE virtual CPU on
+#   macOS hosts with fewer than 6 logical cores (android-qemu2-glue/
+#   main.cpp, "SMP limits": the glue forces hw_cpu_ncore to 1; the
+#   action's `cores` input only writes the config value the glue then
+#   overrides). Run #3's log proves it: "less than 6 logical cores...
+#   virtual cores to 1" despite cores: 4 — a 10-minute boot,
+#   system_server ANRs, a role-holder timeout. No flag recovers >1
+#   vCPU for an x86_64 guest on a standard macOS Intel runner.
+#   Ubuntu + KVM is therefore PRIMARY, not a fallback: the action
+#   README recommends Ubuntu as 2-3x faster, KVM satisfies the
+#   emulator's modern-x86-virtualization check, and the guest keeps
+#   the configured 4 vCPUs. macOS Intel stays in the README as a
+#   fallback ONLY, with the 1-vCPU limit stated plainly.
+# - KVM step is verbatim from the action README ("Enable KVM group
+#   perms"); -accel on makes a missing-KVM run fail fast instead of
+#   crawling. Diagnostics (df -h, /dev/kvm, nproc) run first so a
+#   failure log shows whether disk or KVM was the cause.
 # - arch x86_64 + target google_apis (ships Chrome; the `default`
-#   image has none). arm64-v8a images cannot run on Intel hosts.
+#   image has none).
 # - emulator-boot-timeout 1200 s (action default 600 s) for headroom
 #   on the first cold boot.
 # - NO AVD snapshot caching. A snapshot saved from an unsettled boot
-#   replays a black/ANR state on every later run (proven in testing).
+#   was proven to replay a black/ANR state on every later run.
 #   Cold boot every run (-no-snapshot): slower, always known-good.
 # - ram-size 4096M + cores 4: 2048M is the documented minimum and
 #   produced system-level "isn't responding" ANRs under SwiftShader
-#   software rendering, which is CPU-bound.
+#   software rendering, which is CPU-bound. On Ubuntu the cores
+#   value actually applies.
 # - GPU mode swiftshader_indirect, unchanged: the compositor was
 #   proven working; churning GPU modes for unrelated failures hides
 #   the real cause. Fallback order is in the README.
 # - Frame verification lives in scripts/capture.sh (settled-boot
-#   waits, display stay-on, Chrome-foreground polling, ANR dismissal,
+#   waits, display stay-on, per-shot foreground + ANR + URL gates,
 #   stdlib-python3 pixel check with retries). The workflow must go
 #   RED if no real frame is captured.
 # - The emulator is killed when the emulator-runner step ends, so
@@ -66,15 +81,24 @@ permissions:
 
 jobs:
   capture:
-    runs-on: macos-15-intel
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
 
     steps:
       - name: Check out
         uses: actions/checkout@v4
 
-      - name: Check free disk space
-        run: df -h
+      - name: Enable KVM group perms
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Check free disk space and KVM
+        run: |
+          df -h
+          ls -l /dev/kvm || true
+          nproc
 
       - name: Boot emulator and capture screenshots
         uses: reactivecircus/android-emulator-runner@v2.38.0
@@ -87,7 +111,7 @@ jobs:
           cores: 4
           force-avd-creation: false
           emulator-boot-timeout: 1200
-          emulator-options: -no-snapshot -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          emulator-options: -no-snapshot -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -accel on
           disable-animations: true
           script: bash scripts/capture.sh "${{ inputs.url }}"
 
