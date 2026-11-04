@@ -298,6 +298,18 @@ November 2026, and every failure is recorded here so nobody repeats it:
   the new Ubuntu config. One verified-green run here de-risks the
   twin KhetBook run, since the logic is shared — then run the
   KhetBook repo for the actual listing captures.
+- **Run #4 follow-up (notifications promo card):** run 41847287396
+  (commit f6ae52c, Ubuntu+KVM) went green with a REAL frame — and a
+  Chrome "Chrome notifications make things easier" promo card
+  ("No thanks" / "Continue") covering the middle of the page and
+  hiding the heading. The `--disable-fre` flags did not suppress it
+  on the `google_apis` API 34 image. `capture.sh` now dismisses the
+  card before any shot is accepted (UI dump → tap "No thanks" →
+  re-dump verifies it is gone, max 3 attempts; a card that cannot be
+  dismissed, or a dump that cannot be obtained, fails the run with a
+  diagnostic frame). Verified locally with a fake-`adb` harness
+  only; a real run is still the proof the dismissal fires on the
+  actual image.
 
 If you improve it, keep the rule that made it trustworthy: **a run that
 cannot prove a real frame must go red, never green.**
