@@ -38,6 +38,18 @@
 # (the workflow goes RED) and saves the last failed frame as a
 # diagnostic. A green run means real screenshots.
 #
+# One more pre-shot step, added after run 41847287396: Chrome's
+# notifications promo card ("Chrome notifications make things
+# easier", "No thanks" / "Continue") is NOT suppressed by the
+# --disable-fre flags on the google_apis API 34 image. That run
+# went green with a real frame — and the card covering the middle
+# of the page, hiding the heading. Before any shot is accepted the
+# script dumps the UI hierarchy, taps "No thanks" if the card is
+# present, and verifies by re-dump that it is gone (max 3
+# attempts). A card that cannot be dismissed, or a dump that
+# cannot be obtained, fails the run: an obscured frame must never
+# be accepted.
+#
 # The URL is passed as the first argument (or CAPTURE_URL); it is a
 # public page. Nothing is typed, nothing is submitted, no login.
 set -euo pipefail
@@ -401,6 +413,141 @@ do_swipe() {
   sleep 5
 }
 
+# fetch_ui_dump <outfile>: write the current UI hierarchy XML to
+# <outfile>; 0 = usable dump written, 1 = every method failed. The
+# two methods mirror check_anr_state (same commands, same order): a
+# stdout dump first (no file transfer), then dump-to-file read back
+# with `cat` (no `adb pull`). The third ANR method, dumpsys window
+# focus, is deliberately NOT used here: it reports which window is
+# focused, not the node hierarchy, so it can neither prove the
+# promo card present nor absent — treating its output as
+# card-absence evidence would re-open the fail-open hole this
+# script exists to close. A dump is accepted only if it is
+# non-empty and contains nodes. Diagnostics go to stderr.
+fetch_ui_dump() {
+  local out="$1" err="$OUT_DIR/.dump-method.err"
+  rm -f "$out" "$err"
+  if run_with_timeout 60 adb exec-out uiautomator dump /dev/tty >"$out" 2>"$err"; then
+    if [ -s "$out" ] && grep -q "<node" "$out"; then
+      return 0
+    fi
+    echo "[capture] WARN: UI dump method 1 returned empty/unusable output; stderr: $(head -c 300 "$err" | tr '\n' ' ')" >&2
+  else
+    echo "[capture] WARN: UI dump method 1 (exec-out dump) failed/timed out; stderr: $(head -c 300 "$err" | tr '\n' ' ')" >&2
+  fi
+  rm -f "$out" "$err"
+  if run_with_timeout 60 adb shell uiautomator dump /sdcard/window_dump.xml >"$OUT_DIR/.dump-m2.log" 2>"$err"; then
+    if run_with_timeout 30 adb shell cat /sdcard/window_dump.xml >"$out" 2>"$err"; then
+      if [ -s "$out" ] && grep -q "<node" "$out"; then
+        return 0
+      fi
+      echo "[capture] WARN: UI dump method 2 (cat) returned empty/unusable output." >&2
+    else
+      echo "[capture] WARN: UI dump method 2 (cat) failed/timed out; stderr: $(head -c 300 "$err" | tr '\n' ' ')" >&2
+    fi
+  else
+    echo "[capture] WARN: UI dump method 2 (dump to file) failed/timed out; stderr: $(head -c 300 "$err" | tr '\n' ' ')" >&2
+  fi
+  return 1
+}
+
+# find_promo_button <dumpfile>: print exactly one line on stdout:
+#   "TAP <x> <y>" when the notifications promo's "No thanks" button
+#   is in the dump, "ABSENT" when the dump parses and has no such
+#   button, "UNPARSABLE" when the dump is not usable XML. Matches
+#   the button by its exact text first; falls back to a resource-id
+#   containing "no_thanks" (id spelling unverified on this image —
+#   it can only fire on an id that literally says so). The centre
+#   of the button's bounds is the tap point.
+find_promo_button() {
+  python3 - "$1" <<'PYEOF'
+import sys, xml.etree.ElementTree as ET
+path = sys.argv[1]
+try:
+    root = ET.parse(path).getroot()
+except Exception:
+    print("UNPARSABLE")
+    sys.exit(0)
+
+def center(bounds):
+    try:
+        a, b = bounds.split("][")
+        x1, y1 = a.lstrip("[").split(",")
+        x2, y2 = b.rstrip("]").split(",")
+        return ((int(x1) + int(x2)) // 2, (int(y1) + int(y2)) // 2)
+    except Exception:
+        return None
+
+for node in root.iter("node"):
+    if node.get("text") == "No thanks" or node.get("content-desc") == "No thanks":
+        c = center(node.get("bounds", ""))
+        if c:
+            print("TAP %d %d" % c)
+            sys.exit(0)
+for node in root.iter("node"):
+    rid = (node.get("resource-id") or "").lower()
+    if "no_thanks" in rid:
+        c = center(node.get("bounds", ""))
+        if c:
+            print("TAP %d %d" % c)
+            sys.exit(0)
+print("ABSENT")
+PYEOF
+}
+
+# dismiss_notifications_card: 0 = the notifications promo card is
+# absent, or was present and is now verified gone. 1 = the card is
+# still present after 3 dismissal attempts, or the UI dump could
+# not be obtained/parsed — an obscured or unverifiable frame must
+# never be accepted, so the caller fails the run. Every step is
+# logged; a tap is verified gone by a fresh re-dump, never assumed.
+dismiss_notifications_card() {
+  local attempt=1 dump="$OUT_DIR/.promo-dump.xml" found="" x="" y=""
+  while [ "$attempt" -le 3 ]; do
+    if ! fetch_ui_dump "$dump" 2>"$OUT_DIR/.promo-dump.err"; then
+      cat "$OUT_DIR/.promo-dump.err" 2>/dev/null || true
+      log "ERROR: could not obtain a UI dump to check for the notifications promo card (attempt $attempt)."
+      return 1
+    fi
+    cat "$OUT_DIR/.promo-dump.err" 2>/dev/null || true
+    found="$(find_promo_button "$dump" || true)"
+    case "$found" in
+      ABSENT)
+        log "Notifications promo card: absent (attempt $attempt)."
+        return 0
+        ;;
+      TAP*)
+        set -- $found
+        x="$2"
+        y="$3"
+        log "Notifications promo card found; tapping \"No thanks\" at $x,$y (attempt $attempt)."
+        adb shell input tap "$x" "$y" || true
+        sleep 10
+        ;;
+      *)
+        log "ERROR: UI dump unparsable while checking for the notifications promo card (attempt $attempt; result: '$found')."
+        return 1
+        ;;
+    esac
+    attempt=$((attempt + 1))
+  done
+  # The loop above tapped 3 times; one final re-dump must prove the
+  # card is actually gone before any shot is accepted.
+  if ! fetch_ui_dump "$dump" 2>"$OUT_DIR/.promo-dump.err"; then
+    cat "$OUT_DIR/.promo-dump.err" 2>/dev/null || true
+    log "ERROR: could not obtain a final UI dump to verify the notifications promo card is gone."
+    return 1
+  fi
+  cat "$OUT_DIR/.promo-dump.err" 2>/dev/null || true
+  found="$(find_promo_button "$dump" || true)"
+  if [ "$found" = "ABSENT" ]; then
+    log "Notifications promo card dismissed (verified gone by re-dump)."
+    return 0
+  fi
+  log "ERROR: notifications promo card still present after 3 dismissal attempts (last check: '$found')."
+  return 1
+}
+
 # capture_verified_frame <outfile> <label> <check_url: 0|1>
 # Gates, in order, on EVERY attempt: (A) Chrome foreground,
 # (B) ANR-free verified, (C) URL evidence when required (shot 1, and
@@ -525,6 +672,25 @@ adb shell am start -a android.intent.action.VIEW -d "$URL" com.android.chrome ||
 wait_for_chrome_foreground
 log "Page settle: sleeping 45s for the page to render..."
 sleep 45
+
+# Chrome's notifications promo card ("Chrome notifications make
+# things easier", "No thanks" / "Continue") is not suppressed by
+# the --disable-fre flags on the google_apis API 34 image: run
+# 41847287396 went green with the card covering the middle of the
+# page. Dismiss it before any shot is accepted — a card over the
+# page must never reach a listing frame.
+if ! dismiss_notifications_card; then
+  log "Capturing a diagnostic frame of the stuck screen..."
+  adb exec-out screencap -p > "$OUT_DIR/00-last-failed-frame-promo-card.png" || true
+  if [ ! -s "$OUT_DIR/00-last-failed-frame-promo-card.png" ]; then
+    rm -f "$OUT_DIR/00-last-failed-frame-promo-card.png" 2>/dev/null || true
+    log "WARN: diagnostic screencap was empty; no diagnostic frame saved."
+  else
+    log "Diagnostic saved: 00-last-failed-frame-promo-card.png"
+  fi
+  log "ERROR: notifications promo card could not be dismissed; refusing to capture obscured frames."
+  exit 1
+fi
 
 capture_verified_frame "$OUT_DIR/01-settled.png" "settled" 1
 
