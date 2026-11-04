@@ -310,6 +310,7 @@ November 2026, and every failure is recorded here so nobody repeats it:
   diagnostic frame). Verified locally with a fake-`adb` harness
   only; a real run is still the proof the dismissal fires on the
   actual image.
+- **Follow-up fix (run 41852842912):** the dump parser rejected a valid dump — `uiautomator dump` prefixes stdout with a status line before the XML, so `find_promo_button` now strips everything before `<?xml` / `<hierarchy` (BOM and CR-LF tolerated); UNPARSABLE only when no XML start marker exists or parsing still fails.
 
 If you improve it, keep the rule that made it trustworthy: **a run that
 cannot prove a real frame must go red, never green.**
