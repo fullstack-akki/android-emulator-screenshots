@@ -464,7 +464,20 @@ find_promo_button() {
 import sys, xml.etree.ElementTree as ET
 path = sys.argv[1]
 try:
-    root = ET.parse(path).getroot()
+    with open(path, "rb") as fh:
+        data = fh.read()
+    # uiautomator dump prefixes its stdout with a one-line status
+    # message ("UI hierchary dumped to: ...") before the XML; strip
+    # everything before the XML start, or the parse below fails on
+    # the prefix even though the dump itself is valid.
+    if data.startswith(b"\xef\xbb\xbf"):
+        data = data[3:]
+    start = data.find(b"<?xml")
+    if start < 0:
+        start = data.find(b"<hierarchy")
+    if start < 0:
+        raise ValueError("no XML start marker")
+    root = ET.fromstring(data[start:])
 except Exception:
     print("UNPARSABLE")
     sys.exit(0)
