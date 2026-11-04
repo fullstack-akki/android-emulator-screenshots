@@ -1,0 +1,101 @@
+# Android emulator screenshots — any URL, GitHub Actions, no setup
+#
+# Boots a REAL Android emulator on a GitHub-hosted macOS runner, opens
+# mobile Chrome to the URL you choose, and uploads VERIFIED screenshots
+# as workflow artifacts. Manual trigger only (workflow_dispatch).
+# No login, no credentials, no data creation, no local Android Studio,
+# no Mac required on your side — GitHub's runners do the work.
+#
+# Hardened the hard way (Nov 2026): an earlier config went green while
+# uploading a completely black frame and an "isn't responding" dialog,
+# because nothing checked the frames. This workflow fails LOUDLY
+# instead: every frame is pixel-checked and retried, and the run goes
+# red rather than upload unusable screenshots. See README.md.
+#
+# Design notes (verified against live sources, Nov 2026):
+# - Runner is macos-15-intel (4-core Intel, 14 GB RAM), NOT macos-15
+#   (ARM). ARM macOS runners cannot run the Android emulator: nested
+#   virtualization is unavailable and Hypervisor.Framework returns
+#   HV_UNSUPPORTED, so the emulator never finishes booting
+#   (ReactiveCircus/android-emulator-runner#350). Intel runners are
+#   bare-metal Macs where hardware acceleration works.
+# - arch x86_64 + target google_apis (ships Chrome; the `default`
+#   image has none). arm64-v8a images cannot run on Intel hosts.
+# - emulator-boot-timeout 1200 s (action default 600 s) for headroom
+#   on the first cold boot.
+# - NO AVD snapshot caching. A snapshot saved from an unsettled boot
+#   replays a black/ANR state on every later run (proven in testing).
+#   Cold boot every run (-no-snapshot): slower, always known-good.
+# - ram-size 4096M + cores 4: 2048M is the documented minimum and
+#   produced system-level "isn't responding" ANRs under SwiftShader
+#   software rendering, which is CPU-bound.
+# - GPU mode swiftshader_indirect, unchanged: the compositor was
+#   proven working; churning GPU modes for unrelated failures hides
+#   the real cause. Fallback order is in the README.
+# - Frame verification lives in scripts/capture.sh (settled-boot
+#   waits, display stay-on, Chrome-foreground polling, ANR dismissal,
+#   stdlib-python3 pixel check with retries). The workflow must go
+#   RED if no real frame is captured.
+# - The emulator is killed when the emulator-runner step ends, so
+#   screenshots MUST be written to the workspace inside capture.sh;
+#   the upload step (if: always()) then uploads them as artifacts.
+
+name: Android emulator screenshots
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "URL to open in mobile Chrome and screenshot"
+        required: true
+        default: "https://example.com"
+        type: string
+      profile:
+        description: "Emulator device profile (must exist in the SDK)"
+        required: false
+        default: "pixel_6"
+        type: string
+      api-level:
+        description: "Android API level of the system image"
+        required: false
+        default: "34"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Check free disk space
+        run: df -h
+
+      - name: Boot emulator and capture screenshots
+        uses: reactivecircus/android-emulator-runner@v2.38.0
+        with:
+          api-level: ${{ inputs.api-level }}
+          target: google_apis
+          arch: x86_64
+          profile: ${{ inputs.profile }}
+          ram-size: 4096M
+          cores: 4
+          force-avd-creation: false
+          emulator-boot-timeout: 1200
+          emulator-options: -no-snapshot -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: bash scripts/capture.sh "${{ inputs.url }}"
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-emulator-screenshots
+          path: screenshots/
+          if-no-files-found: error
+          retention-days: 30
