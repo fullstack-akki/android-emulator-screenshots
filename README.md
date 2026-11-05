@@ -186,7 +186,7 @@ Known limits:
 
 ## How this was hardened
 
-This workflow was built and debugged in public over three runs in
+This workflow was built and debugged in public over seven runs in
 November 2026, and every failure is recorded here so nobody repeats it:
 
 - **Run 1:** ARM runner + `-accel off` — emulator never booted
@@ -307,10 +307,12 @@ November 2026, and every failure is recorded here so nobody repeats it:
   card before any shot is accepted (UI dump → tap "No thanks" →
   re-dump verifies it is gone, max 3 attempts; a card that cannot be
   dismissed, or a dump that cannot be obtained, fails the run with a
-  diagnostic frame). Verified locally with a fake-`adb` harness
-  only; a real run is still the proof the dismissal fires on the
-  actual image.
+  diagnostic frame). Verified locally with a fake-`adb` harness;
+  the real-run proof is Run #7 below.
 - **Follow-up fix (run 41852842912):** the dump parser rejected a valid dump — `uiautomator dump` prefixes stdout with a status line before the XML, so `find_promo_button` now strips everything before `<?xml` / `<hierarchy` (BOM and CR-LF tolerated); UNPARSABLE only when no XML start marker exists or parsing still fails.
+- **Run #6 (Pixel Launcher ANR — 6 Nov 2026):** commit 83bfef1 fixed the promo-card dismiss (retry + Back fallback, robust XML parse, notifications revoke, shorter sleeps) and the run got past the dismiss — but died after 14m 24s at the ANR gate: "no clean frame after 3 attempts". The last failed frame showed the KhetBook page loaded fine, the promo card STILL visible, and the ANR dialog was "Pixel Launcher isn't responding" — not Chrome's. The old code tapped Wait up to 15 times (3 probes × 5 attempts) on the same stuck dialog and never cleared it; the ANR parser had the same trailing-junk bug as the promo parser, and its stderr was discarded.
+- **The fix (commit e9dc131):** `anr_check.py` trims to `</hierarchy>` and prints the dialog title on stderr; ANR recovery is now BOUNDED and runs at most once per shot — diagnostics first (logcat ANR/LMK/OOM lines, Launcher meminfo, host free/CPU into the artifact), Wait once, then "Close app" once ONLY for a confirmed launcher ANR (identified by dialog title + `android:id/aerr_close`, coordinates from the dump), verified end-to-end (dialog gone + Chrome foreground + URL); any other ANR fails fast with diagnostics. The promo-card dismiss is re-run after page settle (the card can appear late) and the revoke's real exit code + permission state are logged. Verified locally with a fake-`adb` harness (17 ensure_no_anr scenarios, 6 anr_check tests, 4 promo-button tests) — all green.
+- **Run #7 (green — 6 Nov 2026, 00:43 IST):** run 42090985531, commit e9dc131, 4m 19s. Promo card found, tapped "No thanks", confirmed absent; ANR checks clear; URL verified in the Chrome tab. Both frames passed the pixel gates (settled: nonblack 1.0000, brightness 66.6; scrolled: nonblack 0.9959, brightness 72.9; 1080×2400) and were visually verified as real KhetBook pages. This is the proof the dismissal fires on the actual image.
 
 If you improve it, keep the rule that made it trustworthy: **a run that
 cannot prove a real frame must go red, never green.**
