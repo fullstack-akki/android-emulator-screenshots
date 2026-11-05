@@ -64,6 +64,11 @@ URL="${1:-${CAPTURE_URL:-https://example.com}}"
 OUT_DIR="screenshots"
 mkdir -p "$OUT_DIR"
 
+# ANR_RECOVERY_DONE: 1 once the single bounded ANR recovery has run
+# for the current shot (see ensure_no_anr). Reset to 0 by
+# capture_verified_frame at the start of each shot.
+ANR_RECOVERY_DONE=0
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FRAME_CHECK="$SCRIPT_DIR/frame_check.py"
 ANR_CHECK="$SCRIPT_DIR/anr_check.py"
@@ -216,14 +221,20 @@ check_anr_state() {
   rm -f "$out" "$err"
   if run_with_timeout 60 adb exec-out uiautomator dump /dev/tty >"$out" 2>"$err"; then
     if [ -s "$out" ]; then
-      result="$(python3 "$ANR_CHECK" - <"$out" 2>/dev/null || true)"
+      # Python's stderr is KEPT (the ANR dialog title, e.g. "Pixel
+      # Launcher isn't responding", goes there): discarding it with
+      # 2>/dev/null hid which app was ANRing in run #6's log.
+      result="$(python3 "$ANR_CHECK" - <"$out" 2>"$OUT_DIR/.anr-py.err" || true)"
       case "$result" in
         NO_ANR|WAIT*|ANR_NO_WAIT)
+          if [ -s "$OUT_DIR/.anr-py.err" ]; then
+            echo "[capture] ANR detail: $(head -c 200 "$OUT_DIR/.anr-py.err" | tr '\n' ' ')" >&2
+          fi
           echo "$result"
           return 0
           ;;
       esac
-      echo "[capture] WARN: ANR method 1 output unparsable; stderr: $(head -c 300 "$err" | tr '\n' ' ')" >&2
+      echo "[capture] WARN: ANR method 1 output unparsable; python stderr: $(head -c 300 "$OUT_DIR/.anr-py.err" | tr '\n' ' '); dump stderr: $(head -c 300 "$err" | tr '\n' ' ')" >&2
     else
       echo "[capture] WARN: ANR method 1 returned empty output; stderr: $(head -c 300 "$err" | tr '\n' ' ')" >&2
     fi
@@ -238,14 +249,17 @@ check_anr_state() {
   if run_with_timeout 60 adb shell uiautomator dump /sdcard/window_dump.xml >"$OUT_DIR/.anr-m2.log" 2>"$err"; then
     if run_with_timeout 30 adb shell cat /sdcard/window_dump.xml >"$out" 2>"$err"; then
       if [ -s "$out" ]; then
-        result="$(python3 "$ANR_CHECK" - <"$out" 2>/dev/null || true)"
+        result="$(python3 "$ANR_CHECK" - <"$out" 2>"$OUT_DIR/.anr-py.err" || true)"
         case "$result" in
           NO_ANR|WAIT*|ANR_NO_WAIT)
+            if [ -s "$OUT_DIR/.anr-py.err" ]; then
+              echo "[capture] ANR detail: $(head -c 200 "$OUT_DIR/.anr-py.err" | tr '\n' ' ')" >&2
+            fi
             echo "$result"
             return 0
             ;;
         esac
-        echo "[capture] WARN: ANR method 2 output unparsable." >&2
+        echo "[capture] WARN: ANR method 2 output unparsable; python stderr: $(head -c 300 "$OUT_DIR/.anr-py.err" | tr '\n' ' ')" >&2
       else
         echo "[capture] WARN: ANR method 2 (cat) returned empty output." >&2
       fi
@@ -282,9 +296,168 @@ check_anr_state() {
   return 0
 }
 
-# ensure_no_anr: 0 only when the screen is PROVEN ANR-free. A Wait tap
-# is verified gone by an immediate re-dump; an unverified tap counts
-# for nothing. Up to 3 probes, then 1 (caller rejects the frame).
+# collect_anr_diagnostics: best-effort evidence capture when an ANR
+# is confirmed, so the artifact PROVES (not guesses) whether the
+# device was overloaded. Files land in OUT_DIR and are uploaded
+# with the artifact. Never fails the script. Run #6 died on a
+# launcher ANR with no evidence at all — no logcat, no meminfo,
+# no host numbers — so the next run must not repeat that.
+collect_anr_diagnostics() {
+  log "Collecting ANR diagnostics into $OUT_DIR ..."
+  adb logcat -b all -d 2>/dev/null \
+    | grep -iE "ANR|am_anr|lowmemorykiller|onTrimMemory|oom" \
+    | tail -50 > "$OUT_DIR/.anr-logcat.txt" 2>/dev/null || true
+  adb shell dumpsys meminfo com.google.android.apps.nexuslauncher 2>/dev/null \
+    | head -30 > "$OUT_DIR/.launcher-meminfo.txt" 2>/dev/null || true
+  { free -m; uptime; } > "$OUT_DIR/.host-resources.txt" 2>/dev/null || true
+  log "ANR diagnostics collected (logcat lines: $(wc -l <"$OUT_DIR/.anr-logcat.txt" 2>/dev/null || echo 0))."
+}
+
+# anr_dialog_info <dumpfile>: print on stdout:
+#   TITLE <dialog title text>     (the node text containing
+#     "isn't responding" / "not responding")
+#   CLOSE <x> <y> | CLOSE ABSENT  (the dialog's Close-app button,
+#     by resource-id android:id/aerr_close; fallback exact text
+#     "Close app". Coordinates come from the dump — never guessed.)
+#   UNPARSABLE (single line) if the dump cannot be parsed.
+anr_dialog_info() {
+  python3 - "$1" <<'PYEOF'
+import sys, xml.etree.ElementTree as ET
+path = sys.argv[1]
+try:
+    with open(path, "rb") as fh:
+        data = fh.read()
+    if data.startswith(b"\xef\xbb\xbf"):
+        data = data[3:]
+    start = data.find(b"<?xml")
+    if start < 0:
+        start = data.find(b"<hierarchy")
+    if start < 0:
+        raise ValueError("no XML start marker")
+    end = data.rfind(b"</hierarchy>")
+    if end >= start:
+        data = data[: end + len(b"</hierarchy>")]
+    root = ET.fromstring(data[start:])
+except Exception as exc:
+    print("UNPARSABLE: %s" % exc, file=sys.stderr)
+    print("UNPARSABLE")
+    sys.exit(0)
+
+def center(bounds):
+    try:
+        a, b = bounds.split("][")
+        x1, y1 = a.lstrip("[").split(",")
+        x2, y2 = b.rstrip("]").split(",")
+        return ((int(x1) + int(x2)) // 2, (int(y1) + int(y2)) // 2)
+    except Exception:
+        return None
+
+title = ""
+for node in root.iter("node"):
+    t = (node.get("text") or "")
+    low = t.lower()
+    if "isn't responding" in low or "not responding" in low:
+        title = t
+        break
+print("TITLE %s" % title)
+
+close = None
+for node in root.iter("node"):
+    if node.get("resource-id") == "android:id/aerr_close":
+        close = center(node.get("bounds", ""))
+        if close:
+            break
+if not close:
+    for node in root.iter("node"):
+        if node.get("text") == "Close app" or node.get("content-desc") == "Close app":
+            close = center(node.get("bounds", ""))
+            if close:
+                break
+if close:
+    print("CLOSE %d %d" % close)
+else:
+    print("CLOSE ABSENT")
+PYEOF
+}
+
+# anr_close_launcher: 0 only when a LAUNCHER ANR was closed and the
+# screen is verified recovered (dialog gone, Chrome foreground, URL
+# verified). Any other ANR app — Chrome itself, System UI, or an
+# unidentifiable dialog — fails fast with diagnostics: closing the
+# wrong app blindly would kill Chrome or the system UI and the run
+# would still fail, just later and with less evidence. The Close
+# tap happens at most once per call, and the caller runs this at
+# most once per shot.
+anr_close_launcher() {
+  local dump="$OUT_DIR/.anr-dialog-dump.xml" info="" title="" close="" x="" y="" state=""
+  if ! fetch_ui_dump "$dump" 2>"$OUT_DIR/.anr-dialog-dump.err"; then
+    cat "$OUT_DIR/.anr-dialog-dump.err" 2>/dev/null || true
+    log "ERROR: cannot obtain a UI dump to identify the ANR app; failing fast (never blindly Close)."
+    return 1
+  fi
+  cat "$OUT_DIR/.anr-dialog-dump.err" 2>/dev/null || true
+  info="$(anr_dialog_info "$dump" || true)"
+  if printf '%s' "$info" | grep -q "UNPARSABLE"; then
+    log "ERROR: ANR dialog dump unparsable; cannot identify the ANR app; failing fast."
+    return 1
+  fi
+  title="$(printf '%s\n' "$info" | sed -n 's/^TITLE //p')"
+  close="$(printf '%s\n' "$info" | sed -n 's/^CLOSE //p')"
+  log "ANR dialog title: '$title' (Close button: ${close:-ABSENT})."
+  case "$(printf '%s' "$title" | tr '[:upper:]' '[:lower:]')" in
+    *launcher*)
+      ;;
+    *)
+      log "ERROR: ANR is '$title' — not the launcher; failing fast with diagnostics (no Close tap)."
+      return 1
+      ;;
+  esac
+  case "$close" in
+    ABSENT|UNPARSABLE|"")
+      log "ERROR: launcher ANR confirmed but no Close-app button found in the dump; failing fast."
+      return 1
+      ;;
+  esac
+  set -- $close
+  x="$1"
+  y="$2"
+  log "Launcher ANR confirmed; tapping Close app at $x,$y (once)."
+  adb shell input tap "$x" "$y" || true
+  sleep 10
+  state="$(check_anr_state 2>"$OUT_DIR/.anr-state.err")"
+  cat "$OUT_DIR/.anr-state.err" 2>/dev/null || true
+  if [ "$state" != "NO_ANR" ]; then
+    log "ERROR: ANR dialog still present after Close tap (state: $state); failing fast."
+    return 1
+  fi
+  if ! chrome_is_foreground; then
+    log "WARN: Chrome lost the foreground after closing the launcher ANR; re-firing the intent."
+    refire_intent
+    if ! chrome_is_foreground; then
+      log "ERROR: Chrome is still not the foreground app after re-fire; failing fast."
+      return 1
+    fi
+  fi
+  if verify_url_loaded; then
+    log "Launcher ANR recovered: dialog gone, Chrome foreground, URL verified."
+    return 0
+  fi
+  log "ERROR: URL not verified in a Chrome tab after launcher ANR recovery; failing fast."
+  return 1
+}
+
+# ensure_no_anr: 0 only when the screen is PROVEN ANR-free.
+# BOUNDED recovery (run #6 fix): the old code probed up to 3 times
+# per shot attempt and tapped Wait on every probe — up to 15 Wait
+# taps on the same stuck "Pixel Launcher isn't responding" dialog
+# across 5 attempts, and the run still died at the ANR gate. Now
+# the recovery runs AT MOST ONCE per shot (ANR_RECOVERY_DONE, reset
+# by capture_verified_frame per shot): on the first ANR, collect
+# diagnostics, tap Wait ONCE and verify; if still ANR, only a
+# confirmed launcher ANR gets one Close tap (anr_close_launcher),
+# verified end to end. Any later ANR in the same shot rejects
+# immediately without re-tapping. UNKNOWN states still get up to 3
+# probes (they are transient dump failures, not a stuck dialog).
 ensure_no_anr() {
   local probe=1 state="" x="" y=""
   while [ "$probe" -le 3 ]; do
@@ -295,23 +468,35 @@ ensure_no_anr() {
         log "ANR check: clear (probe $probe)."
         return 0
         ;;
-      WAIT*)
-        set -- $state
-        x="$2"
-        y="$3"
-        log "ANR dialog found; tapping Wait at $x,$y (probe $probe)."
-        adb shell input tap "$x" "$y" || true
-        sleep 10
-        state="$(check_anr_state 2>"$OUT_DIR/.anr-state.err")"
-        cat "$OUT_DIR/.anr-state.err" 2>/dev/null || true
-        if [ "$state" = "NO_ANR" ]; then
-          log "ANR dialog dismissed (verified by re-dump)."
+      WAIT*|ANR_NO_WAIT)
+        if [ "$ANR_RECOVERY_DONE" -eq 1 ]; then
+          log "ERROR: ANR still present and the one recovery for this shot was already used; rejecting without re-tapping (state: $state)."
+          return 1
+        fi
+        ANR_RECOVERY_DONE=1
+        log "ANR dialog present (state: $state); running the single bounded recovery for this shot."
+        collect_anr_diagnostics
+        if [ "$state" != "ANR_NO_WAIT" ]; then
+          set -- $state
+          x="$2"
+          y="$3"
+          log "Tapping Wait at $x,$y (once)."
+          adb shell input tap "$x" "$y" || true
+          sleep 10
+          state="$(check_anr_state 2>"$OUT_DIR/.anr-state.err")"
+          cat "$OUT_DIR/.anr-state.err" 2>/dev/null || true
+          if [ "$state" = "NO_ANR" ]; then
+            log "ANR dialog dismissed by Wait (verified by re-dump)."
+            return 0
+          fi
+          log "WARN: ANR dialog still present after Wait tap (state: $state)."
+        else
+          log "WARN: ANR dialog present but no Wait button found; skipping the Wait tap."
+        fi
+        if anr_close_launcher; then
           return 0
         fi
-        log "WARN: ANR dialog still present after Wait tap (state: $state)."
-        ;;
-      ANR_NO_WAIT)
-        log "WARN: ANR dialog present but no Wait button found (probe $probe)."
+        return 1
         ;;
       UNKNOWN)
         log "WARN: ANR state UNKNOWN — all dump methods failed (probe $probe)."
@@ -459,8 +644,11 @@ fetch_ui_dump() {
 
 # find_promo_button <dumpfile>: print exactly one line on stdout:
 #   "TAP <x> <y>" when the notifications promo's "No thanks" button
-#   is in the dump, "ABSENT" when the dump parses and has no such
-#   button, "UNPARSABLE" when the dump is not usable XML. Matches
+#   is in the dump, "CARD_NO_BUTTON" when the card's title text is
+#   in the dump but no "No thanks" button was found (card present,
+#   caller tries Back once — never ABSENT), "ABSENT" when the dump
+#   parses and has no card text/button at all, "UNPARSABLE" when the
+#   dump is not usable XML. Matches
 #   the button by its exact text first; falls back to a resource-id
 #   containing "no_thanks" (id spelling unverified on this image —
 #   it can only fire on an id that literally says so). The centre
@@ -522,6 +710,16 @@ for node in root.iter("node"):
         if c:
             print("TAP %d %d" % c)
             sys.exit(0)
+# The card's title text proves the card is present even when the
+# "No thanks" button node is missed (run #6's failed frame still
+# showed the card after the dismiss step reported ABSENT): a dump
+# carrying the title counts as present, not absent. There is no
+# button to tap, so the caller treats this as "card present, try
+# Back once" rather than a dismissal tap.
+for node in root.iter("node"):
+    if "chrome notifications make things easier" in (node.get("text") or "").lower():
+        print("CARD_NO_BUTTON")
+        sys.exit(0)
 print("ABSENT")
 PYEOF
 }
@@ -540,7 +738,7 @@ PYEOF
 # tap is verified gone by a fresh re-dump, never assumed. On final
 # failure the first ~500 chars of the dump are printed to the log.
 dismiss_notifications_card() {
-  local attempt=1 dump="$OUT_DIR/.promo-dump.xml" found="" x="" y=""
+  local attempt=1 dump="$OUT_DIR/.promo-dump.xml" found="" x="" y="" back_tried=0
   while [ "$attempt" -le 3 ]; do
     if ! fetch_ui_dump "$dump" 2>"$OUT_DIR/.promo-dump.err"; then
       cat "$OUT_DIR/.promo-dump.err" 2>/dev/null || true
@@ -563,6 +761,20 @@ dismiss_notifications_card() {
         log "Notifications promo card found; tapping \"No thanks\" at $x,$y (attempt $attempt)."
         adb shell input tap "$x" "$y" || true
         sleep 10
+        ;;
+      CARD_NO_BUTTON)
+        # Card title present but no "No thanks" button to tap:
+        # treat as PRESENT (never ABSENT) and try Android Back
+        # once; the next attempt re-dumps to verify it is gone.
+        if [ "$back_tried" -eq 0 ]; then
+          back_tried=1
+          log "Notifications promo card title present but no \"No thanks\" button (attempt $attempt); pressing Back once."
+          adb shell input keyevent 4 || true
+          sleep 10
+        else
+          log "Notifications promo card title still present after Back (attempt $attempt); retrying the dump."
+          sleep 5
+        fi
         ;;
       *)
         log "WARN: UI dump unparsable while checking for the notifications promo card (attempt $attempt; result: '$found'); retrying."
@@ -612,6 +824,7 @@ capture_verified_frame() {
   local outfile="$1" label="$2" check_url="$3"
   local tmp="$OUT_DIR/.tmp-$label.png"
   local attempt=1 refired=0 need_url="$check_url" url_rc=0 check_output=""
+  ANR_RECOVERY_DONE=0  # one bounded ANR recovery per shot (see ensure_no_anr).
   while [ "$attempt" -le 5 ]; do
     log "$label: attempt $attempt/5"
     # Gate A: Chrome must be the foreground app.
@@ -726,7 +939,14 @@ adb shell am force-stop com.android.chrome || true
 # revoke grants nothing and is best-effort (|| true). The dismiss
 # step below stays as the safety net regardless.
 log "Revoking Chrome's POST_NOTIFICATIONS permission so the notifications promo card cannot appear..."
-adb shell pm revoke com.android.chrome android.permission.POST_NOTIFICATIONS || true
+# The revoke's REAL exit code is logged (round-1 hid it behind
+# || true): a failed revoke is the first suspect when the card
+# still appears. The permission state is verified right after.
+revoke_rc=0
+adb shell pm revoke com.android.chrome android.permission.POST_NOTIFICATIONS || revoke_rc=$?
+log "POST_NOTIFICATIONS revoke exit code: $revoke_rc"
+log "Chrome POST_NOTIFICATIONS state after revoke:"
+adb shell dumpsys package com.android.chrome 2>/dev/null | grep -i "POST_NOTIFICATIONS" || log "  (no POST_NOTIFICATIONS line in dumpsys output)"
 
 log "Launching Chrome at $URL ..."
 adb shell am start -a android.intent.action.VIEW -d "$URL" com.android.chrome || true
@@ -741,7 +961,13 @@ sleep 45
 # 41847287396 went green with the card covering the middle of the
 # page. Dismiss it before any shot is accepted — a card over the
 # page must never reach a listing frame.
-if ! dismiss_notifications_card; then
+# dismiss_promo_or_die: dismiss the notifications promo card; on
+# failure capture a diagnostic frame and exit 1 — an obscured frame
+# must never be accepted.
+dismiss_promo_or_die() {
+  if dismiss_notifications_card; then
+    return 0
+  fi
   log "Capturing a diagnostic frame of the stuck screen..."
   adb exec-out screencap -p > "$OUT_DIR/00-last-failed-frame-promo-card.png" || true
   if [ ! -s "$OUT_DIR/00-last-failed-frame-promo-card.png" ]; then
@@ -752,7 +978,13 @@ if ! dismiss_notifications_card; then
   fi
   log "ERROR: notifications promo card could not be dismissed; refusing to capture obscured frames."
   exit 1
-fi
+}
+
+dismiss_promo_or_die
+# The card can appear AFTER the first check (run #6's failed frame
+# still showed it) — re-run the dismiss immediately before the
+# first shot so a late-appearing card is caught, not captured.
+dismiss_promo_or_die
 
 capture_verified_frame "$OUT_DIR/01-settled.png" "settled" 1
 

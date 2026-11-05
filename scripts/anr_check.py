@@ -20,6 +20,8 @@ transfer entirely. Input read from stdin may be prefixed by the
 uiautomator status line ("UI hierarchy dumped to: /dev/tty") and may
 carry CR-LF line endings; the XML is extracted starting at the first
 "<?xml" (or "<hierarchy") marker, and anything before it is ignored.
+Anything after the closing "</hierarchy>" tag (status lines, shell
+noise) is dropped the same way, or the parser rejects a valid dump.
 
 Output (always exit 0 unless the input itself is unreadable):
   NO_ANR                 no "isn't responding" dialog is showing
@@ -53,6 +55,15 @@ def read_dump(path):
         start = text.find("<hierarchy")
     if start < 0:
         raise ValueError("no UI hierarchy XML found in input")
+    # uiautomator's stdout can also carry trailing junk AFTER the
+    # closing </hierarchy> tag (status lines, shell noise); the
+    # parser rejects anything past the root element, so slice the
+    # dump to the end of the hierarchy before parsing. Without
+    # this, a valid dump with trailing junk reads as unparsable
+    # (the same Bug B pattern the promo-card parser already trims).
+    end = text.rfind("</hierarchy>")
+    if end >= start:
+        return text[start:end + len("</hierarchy>")]
     return text[start:]
 
 
@@ -71,11 +82,21 @@ def main(argv):
         print("ERROR: cannot parse dump XML: %s" % exc, file=sys.stderr)
         return 2
     nodes = list(root.iter("node"))
-    anr_present = any(
-        ("isn't responding" in (node.get("text") or "").lower()
-         or "not responding" in (node.get("text") or "").lower())
-        for node in nodes
-    )
+    title = ""
+    anr_present = False
+    for node in nodes:
+        text = node.get("text") or ""
+        if ("isn't responding" in text.lower()
+                or "not responding" in text.lower()):
+            anr_present = True
+            if not title:
+                title = text
+    if title:
+        # Surface the dialog's title on stderr only (stdout keeps
+        # the single-token contract): the caller logs it so the run
+        # log identifies WHICH app is ANRing (launcher vs Chrome
+        # vs system) instead of just "an ANR dialog".
+        print("ANR dialog: %s" % title, file=sys.stderr)
     if not anr_present:
         print("NO_ANR")
         return 0
