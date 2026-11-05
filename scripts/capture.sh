@@ -50,6 +50,12 @@
 # cannot be obtained, fails the run: an obscured frame must never
 # be accepted.
 #
+# Since run 41857851484 the script also revokes Chrome's
+# POST_NOTIFICATIONS permission before launch (best-effort), so the
+# card should not appear at all; the dismiss step stays as the
+# safety net, with transient dump/parse failures retried and an
+# Android Back press as the last resort before failing.
+#
 # The URL is passed as the first argument (or CAPTURE_URL); it is a
 # public page. Nothing is typed, nothing is submitted, no login.
 set -euo pipefail
@@ -133,8 +139,8 @@ wait_for_boot() {
   wait_for_prop "package manager" 60 "package:com.android.chrome" \
     adb shell pm list packages com.android.chrome || true
 
-  log "Boot settle: sleeping 30s for System UI to stabilise..."
-  sleep 30
+  log "Boot settle: sleeping 10s for System UI to stabilise..."
+  sleep 10
 }
 
 keep_display_awake() {
@@ -157,14 +163,14 @@ wait_for_launcher() {
         | grep -E "mResumedActivity|mFocusedApp" \
         | grep -qi "launcher"; then
       log "Launcher foreground after ${waited}s"
-      sleep 30
+      sleep 10
       return 0
     fi
     sleep 5
     waited=$((waited + 5))
   done
   log "WARN: launcher not observed in 120s; continuing anyway."
-  sleep 30
+  sleep 10
 }
 
 # chrome_is_foreground: 0 when a com.android.chrome activity is the
@@ -477,8 +483,20 @@ try:
         start = data.find(b"<hierarchy")
     if start < 0:
         raise ValueError("no XML start marker")
+    # uiautomator's stdout can also carry trailing junk AFTER the
+    # closing </hierarchy> tag (status lines, shell noise); the
+    # parser rejects anything past the root element, so slice the
+    # dump to the end of the hierarchy before parsing. Without
+    # this, a valid dump with trailing junk reads as UNPARSABLE
+    # and the dismiss step fails on attempt 1.
+    end = data.rfind(b"</hierarchy>")
+    if end >= start:
+        data = data[: end + len(b"</hierarchy>")]
     root = ET.fromstring(data[start:])
-except Exception:
+except Exception as exc:
+    # Print the real parse error to stderr for the log; stdout must
+    # stay exactly one token ("UNPARSABLE") for the caller.
+    print("UNPARSABLE: %s" % exc, file=sys.stderr)
     print("UNPARSABLE")
     sys.exit(0)
 
@@ -509,18 +527,27 @@ PYEOF
 }
 
 # dismiss_notifications_card: 0 = the notifications promo card is
-# absent, or was present and is now verified gone. 1 = the card is
-# still present after 3 dismissal attempts, or the UI dump could
-# not be obtained/parsed — an obscured or unverifiable frame must
-# never be accepted, so the caller fails the run. Every step is
-# logged; a tap is verified gone by a fresh re-dump, never assumed.
+# absent, or was present and is now verified gone. Transient dump
+# failures and unparsable dumps are RETRIED (sleep 5, next
+# attempt) — a single bad dump must not fail the run (that is the
+# bug that killed run 41857851484: the old code returned 1 on
+# attempt 1). After 3 attempts without a verified dismissal,
+# Android Back is pressed once and the card's absence is
+# re-verified by a fresh dump. 1 = the card is still present, or
+# the UI dump could not be obtained/parsed, after the Back
+# fallback — an obscured or unverifiable frame must never be
+# accepted, so the caller fails the run. Every step is logged; a
+# tap is verified gone by a fresh re-dump, never assumed. On final
+# failure the first ~500 chars of the dump are printed to the log.
 dismiss_notifications_card() {
   local attempt=1 dump="$OUT_DIR/.promo-dump.xml" found="" x="" y=""
   while [ "$attempt" -le 3 ]; do
     if ! fetch_ui_dump "$dump" 2>"$OUT_DIR/.promo-dump.err"; then
       cat "$OUT_DIR/.promo-dump.err" 2>/dev/null || true
-      log "ERROR: could not obtain a UI dump to check for the notifications promo card (attempt $attempt)."
-      return 1
+      log "WARN: could not obtain a UI dump to check for the notifications promo card (attempt $attempt); retrying."
+      sleep 5
+      attempt=$((attempt + 1))
+      continue
     fi
     cat "$OUT_DIR/.promo-dump.err" 2>/dev/null || true
     found="$(find_promo_button "$dump" || true)"
@@ -538,26 +565,40 @@ dismiss_notifications_card() {
         sleep 10
         ;;
       *)
-        log "ERROR: UI dump unparsable while checking for the notifications promo card (attempt $attempt; result: '$found')."
-        return 1
+        log "WARN: UI dump unparsable while checking for the notifications promo card (attempt $attempt; result: '$found'); retrying."
+        sleep 5
         ;;
     esac
     attempt=$((attempt + 1))
   done
-  # The loop above tapped 3 times; one final re-dump must prove the
-  # card is actually gone before any shot is accepted.
+  # 3 attempts did not verify the card gone (taps, transient dump
+  # failures, or unparsable dumps). Last resort before failing:
+  # press Android Back — the promo card is a dialog-like overlay
+  # that Back dismisses — then re-dump to verify it is actually
+  # gone. If Back instead exits Chrome, the per-shot gates + intent
+  # re-fire recover the foreground; the run is already heading for
+  # failure without this attempt, so the fallback can only help.
+  log "Notifications promo card not verified gone after 3 attempts; pressing Back as a last resort..."
+  adb shell input keyevent 4 || true
+  sleep 10
   if ! fetch_ui_dump "$dump" 2>"$OUT_DIR/.promo-dump.err"; then
     cat "$OUT_DIR/.promo-dump.err" 2>/dev/null || true
     log "ERROR: could not obtain a final UI dump to verify the notifications promo card is gone."
+    if [ -s "$dump" ]; then
+      log "Dump head (first 500 chars): $(head -c 500 "$dump" | tr '\n' ' ')"
+    fi
     return 1
   fi
   cat "$OUT_DIR/.promo-dump.err" 2>/dev/null || true
   found="$(find_promo_button "$dump" || true)"
   if [ "$found" = "ABSENT" ]; then
-    log "Notifications promo card dismissed (verified gone by re-dump)."
+    log "Notifications promo card dismissed (verified gone by re-dump after Back)."
     return 0
   fi
-  log "ERROR: notifications promo card still present after 3 dismissal attempts (last check: '$found')."
+  log "ERROR: notifications promo card still present after 3 dismissal attempts + Back (last check: '$found')."
+  if [ -s "$dump" ]; then
+    log "Dump head (first 500 chars): $(head -c 500 "$dump" | tr '\n' ' ')"
+  fi
   return 1
 }
 
@@ -678,6 +719,14 @@ log "Applying Chrome first-run-experience skip flags..."
 # are picked up on launch. --disable-fre skips the welcome / sign-in flow.
 adb shell 'echo "chrome --disable-fre --no-first-run --disable-startup-promos-for-testing --no-default-browser-check" > /data/local/tmp/chrome-command-line' || true
 adb shell am force-stop com.android.chrome || true
+
+# Chrome's notifications promo card appears because Chrome holds the
+# POST_NOTIFICATIONS runtime permission on this image. Revoke it
+# before launch so the card never appears in the first place; the
+# revoke grants nothing and is best-effort (|| true). The dismiss
+# step below stays as the safety net regardless.
+log "Revoking Chrome's POST_NOTIFICATIONS permission so the notifications promo card cannot appear..."
+adb shell pm revoke com.android.chrome android.permission.POST_NOTIFICATIONS || true
 
 log "Launching Chrome at $URL ..."
 adb shell am start -a android.intent.action.VIEW -d "$URL" com.android.chrome || true
