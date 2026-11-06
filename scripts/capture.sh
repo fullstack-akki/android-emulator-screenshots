@@ -818,6 +818,118 @@ print("FIELDS %d %d %d %d %d %d" % (ci[0], ci[1], cp[0], cp[1], cs[0], cs[1]))
 PYEOF
 }
 
+# login_field_state <dumpfile> <expected-email>: print exactly one
+# line on stdout describing the login form's current state:
+#   "STATE ident=<exact|extra|empty|other|missing>
+#          pw_focused=<0|1> id_focused=<0|1> any_focused=<0|1>"
+# or "UNPARSABLE" when the dump is not usable XML.
+#   ident — the identifier node's text vs the expected email:
+#     exact (equal), extra (starts with the email but longer —
+#     the run #8 failure mode, where the password was typed into
+#     the identifier field after the email), empty (no text yet),
+#     other (non-empty and different), missing (no identifier
+#     node). The password field's text is masked in real dumps,
+#     so it is never reported or compared.
+#   pw_focused / id_focused — the focused="true" flag on the
+#     password / identifier node. any_focused — whether ANY node
+#     in the dump is focused (some builds do not expose focus for
+#     web content at all; then focus is undeterminable and the
+#     caller must not treat "not focused" as a definite miss).
+# Field matching mirrors find_login_fields exactly.
+login_field_state() {
+  python3 - "$1" "$2" <<'PYEOF'
+import sys, xml.etree.ElementTree as ET
+path = sys.argv[1]
+want_email = sys.argv[2]
+try:
+    with open(path, "rb") as fh:
+        data = fh.read()
+    if data.startswith(b"\xef\xbb\xbf"):
+        data = data[3:]
+    start = data.find(b"<?xml")
+    if start < 0:
+        start = data.find(b"<hierarchy")
+    if start < 0:
+        raise ValueError("no XML start marker")
+    end = data.rfind(b"</hierarchy>")
+    if end >= start:
+        data = data[: end + len(b"</hierarchy>")]
+    root = ET.fromstring(data[start:])
+except Exception as exc:
+    print("UNPARSABLE: %s" % exc, file=sys.stderr)
+    print("UNPARSABLE")
+    sys.exit(0)
+
+edits = [n for n in root.iter("node") if n.get("class") == "android.widget.EditText"]
+
+ident = None
+for node in edits:
+    rid = (node.get("resource-id") or "").lower()
+    if "identifier" in rid or "username" in rid:
+        ident = node
+        break
+if ident is None:
+    for node in edits:
+        t = (node.get("text") or "") + " " + (node.get("content-desc") or "")
+        if "email@example.com" in t:
+            ident = node
+            break
+if ident is None and edits:
+    ident = edits[0]
+
+pw = None
+for node in edits:
+    rid = (node.get("resource-id") or "").lower()
+    if "password" in rid:
+        pw = node
+        break
+if pw is None:
+    for node in edits:
+        if node.get("password") == "true":
+            pw = node
+            break
+if pw is None:
+    for node in edits:
+        if node is not ident:
+            pw = node
+            break
+
+if ident is None:
+    ident_state = "missing"
+else:
+    t = ident.get("text") or ""
+    if t == "":
+        ident_state = "empty"
+    elif t == want_email:
+        ident_state = "exact"
+    elif t.startswith(want_email):
+        ident_state = "extra"
+    else:
+        ident_state = "other"
+
+def focused(node):
+    return "1" if node is not None and node.get("focused") == "true" else "0"
+
+any_focused = "1" if any((n.get("focused") == "true") for n in root.iter("node")) else "0"
+print("STATE ident=%s pw_focused=%s id_focused=%s any_focused=%s" % (
+    ident_state, focused(pw), focused(ident), any_focused))
+PYEOF
+}
+
+# state_field <state-line> <key>: print the value of key in a
+# "STATE k=v ..." line from login_field_state, or "" when the line
+# is not a STATE line (unparsable dump). The caller treats "" as
+# "cannot determine" and fails closed.
+state_field() {
+  case "$1" in
+    STATE*)
+      local rest="${1#*$2=}"
+      echo "${rest%% *}"
+      ;;
+    *) echo "" ;;
+  esac
+}
+
 # dismiss_save_password_prompt: Chrome may offer to save the password
 # after a successful login ("Save password?" bottom sheet). It would
 # cover the dashboard, so tap "Never" once if it is showing (or Back
@@ -845,6 +957,194 @@ dismiss_save_password_prompt() {
     esac
   fi
   return 0
+}
+
+# dismiss_keyboard_panel: Gboard's clipboard panel ("Copy more for
+# faster pasting" / "Turn on Clipboard") can pop up while typing
+# and cover the lower half of the screen — taps then land on the
+# panel instead of the form (run #8: the password-field tap missed
+# and the password went into the identifier field). The soft
+# keyboard itself also shifts the form. If the dump shows the
+# panel's distinctive text or the IME window (a package containing
+# "inputmethod"), press Back — the IME consumes Back, so this
+# hides the keyboard/panel rather than navigating — bounded to 2
+# presses, re-dumping after each. 0 = keyboard/panel absent (or
+# the dump was unavailable — the focus check decides then);
+# 1 = still showing after the bounded retries.
+dismiss_keyboard_panel() {
+  local dump="$OUT_DIR/.kbd-dump.xml" round=1
+  while [ "$round" -le 2 ]; do
+    if ! fetch_ui_dump "$dump" 2>/dev/null; then
+      return 0
+    fi
+    if grep -q "Copy more for faster pasting\|Turn on Clipboard" "$dump" || grep -q "inputmethod" "$dump"; then
+      log "Keyboard/Gboard panel showing; pressing Back to hide it (round $round)."
+      adb shell input keyevent 4 || true
+      sleep 3
+      round=$((round + 1))
+      continue
+    fi
+    return 0
+  done
+  if fetch_ui_dump "$dump" 2>/dev/null && { grep -q "Copy more for faster pasting\|Turn on Clipboard" "$dump" || grep -q "inputmethod" "$dump"; }; then
+    log "WARN: keyboard/Gboard panel still showing after bounded Back presses."
+    return 1
+  fi
+  return 0
+}
+
+# refresh_login_fields: re-dump and re-find the login form,
+# updating the caller's id_x/id_y/pw_x/pw_y/sub_x/sub_y globals
+# (bash dynamic scope — these are login_or_die's locals). The
+# layout shifts when the keyboard hides/shows, so coordinates
+# from an earlier dump go stale after a Back press. 0 = fresh
+# coordinates; 1 = form not found or dump failed (old
+# coordinates kept).
+refresh_login_fields() {
+  local dump="$OUT_DIR/.login-refresh-dump.xml" found=""
+  if ! fetch_ui_dump "$dump" 2>/dev/null; then
+    log "WARN: could not re-dump the login form; keeping previous coordinates."
+    return 1
+  fi
+  found="$(find_login_fields "$dump" || true)"
+  case "$found" in
+    FIELDS*)
+      set -- $found
+      id_x="$2"; id_y="$3"; pw_x="$4"; pw_y="$5"; sub_x="$6"; sub_y="$7"
+      return 0
+      ;;
+    *)
+      log "WARN: login form not found on refresh ($found); keeping previous coordinates."
+      return 1
+      ;;
+  esac
+}
+
+# tap_password_with_focus_check <dumpfile>: tap the password field
+# (globals pw_x/pw_y) and verify focus actually moved there. A tap
+# that lands on a Gboard panel leaves focus in the identifier
+# field — that is the run #8 bug, and the password typed next
+# appends to the identifier. On a definite miss (identifier still
+# focused, or focus somewhere else entirely) press Back once,
+# re-find the form for fresh coordinates, and retry — bounded to
+# 2 retries. When the dump carries no focus information at all
+# (no node focused — some builds do not expose focus for web
+# content), focus is undeterminable: log a warning and proceed,
+# because the identifier-exactness guard before submit is the
+# backstop that catches a misdirected password. 0 = password
+# focused (or focus undeterminable); 1 = focus never moved.
+# NB: updates the caller's coordinate globals (bash dynamic
+# scope) when it re-finds the form.
+tap_password_with_focus_check() {
+  local dump="$1" state="" pwf="" idf="" anyf="" ident="" try=1
+  while [ "$try" -le 3 ]; do
+    adb shell input tap "$pw_x" "$pw_y" || true
+    sleep 2
+    if fetch_ui_dump "$dump" 2>/dev/null; then
+      state="$(login_field_state "$dump" "$LOGIN_EMAIL" || true)"
+      pwf="$(state_field "$state" pw_focused)"
+      idf="$(state_field "$state" id_focused)"
+      anyf="$(state_field "$state" any_focused)"
+      ident="$(state_field "$state" ident)"
+      if [ -z "$pwf" ] && [ -z "$anyf" ]; then
+        log "WARN: login field state unparsable after password tap $try; retrying."
+      elif [ "$pwf" = "1" ]; then
+        log "Password field focused (tap $try)."
+        return 0
+      elif [ "$anyf" = "0" ]; then
+        log "WARN: no focus information in the UI dump; proceeding (the identifier guard decides)."
+        return 0
+      else
+        log "WARN: password field not focused after tap $try (ident=$ident id_focused=$idf); pressing Back and retrying."
+      fi
+    else
+      log "WARN: could not re-dump after password tap $try; retrying."
+    fi
+    adb shell input keyevent 4 || true
+    sleep 2
+    refresh_login_fields || true
+    try=$((try + 1))
+  done
+  log "ERROR: password field never gained focus after 3 taps."
+  return 1
+}
+
+# guard_identifier_exact <dumpfile>: the identifier field must
+# contain EXACTLY the login email before the form is submitted.
+# Run #8's failure mode was the password typed into the
+# identifier field, so the identifier held email+password and the
+# submit failed with garbage credentials. If the identifier holds
+# extra/other text, recover once: clear the field, re-type the
+# email, re-do the password step, and re-check. 0 = identifier
+# exactly the email; 1 = still wrong after the one recovery (or
+# the identifier is empty/missing, or the dump is unparsable) —
+# the caller fails the attempt with a diagnostic frame.
+# NB: calls tap_password_with_focus_check and updates the
+# caller's coordinate globals via refresh_login_fields.
+guard_identifier_exact() {
+  local dump="$1" state="" ident="" del_args="" i=0
+  if ! fetch_ui_dump "$dump" 2>/dev/null; then
+    log "WARN: could not re-dump for the identifier guard."
+    return 1
+  fi
+  state="$(login_field_state "$dump" "$LOGIN_EMAIL" || true)"
+  ident="$(state_field "$state" ident)"
+  if [ -z "$ident" ]; then
+    log "WARN: login field state unparsable in the identifier guard."
+    return 1
+  fi
+  if [ "$ident" = "exact" ]; then
+    return 0
+  fi
+  if [ "$ident" != "extra" ] && [ "$ident" != "other" ]; then
+    log "WARN: identifier guard: identifier is '$ident', not the login email; not recovering (email never landed)."
+    return 1
+  fi
+  log "WARN: identifier holds extra text (run #8 pattern); clearing it and re-entering the credentials once."
+  # Clear the identifier: tap it, move to the end, delete
+  # generously (email + password length, bounded at 80 DELs;
+  # extra DELs on an empty field are no-ops). `input keyevent`
+  # accepts several key codes in one call.
+  adb shell input tap "$id_x" "$id_y" || true
+  sleep 1
+  adb shell input keyevent 123 || true
+  while [ "$i" -lt 80 ]; do del_args="$del_args 67"; i=$((i + 1)); done
+  # Word-splitting the DEL list is intentional.
+  # shellcheck disable=SC2086
+  adb shell input keyevent $del_args || true
+  sleep 1
+  adb_type "$LOGIN_EMAIL"
+  sleep 2
+  if ! fetch_ui_dump "$dump" 2>/dev/null; then
+    log "WARN: could not re-dump after clearing the identifier."
+    return 1
+  fi
+  state="$(login_field_state "$dump" "$LOGIN_EMAIL" || true)"
+  ident="$(state_field "$state" ident)"
+  if [ "$ident" != "exact" ]; then
+    log "WARN: identifier still '$ident' after clearing and re-typing; giving up."
+    return 1
+  fi
+  log "Identifier re-entered exactly; re-doing the password step."
+  dismiss_keyboard_panel || true
+  refresh_login_fields || true
+  if ! tap_password_with_focus_check "$dump"; then
+    return 1
+  fi
+  adb_type "$LOGIN_PASSWORD"
+  sleep 2
+  if ! fetch_ui_dump "$dump" 2>/dev/null; then
+    log "WARN: could not re-dump after the recovered password entry."
+    return 1
+  fi
+  state="$(login_field_state "$dump" "$LOGIN_EMAIL" || true)"
+  ident="$(state_field "$state" ident)"
+  if [ "$ident" = "exact" ]; then
+    log "Identifier guard passed after recovery."
+    return 0
+  fi
+  log "WARN: identifier is '$ident' after recovery; giving up."
+  return 1
 }
 
 # verify_logged_in_dashboard: 0 only when BOTH hold: a Chrome tab
@@ -882,7 +1182,7 @@ verify_logged_in_dashboard() {
 # outcome appear in the log.
 login_or_die() {
   local attempt=1 dump="$OUT_DIR/.login-dump.xml" found="" tap=""
-  local id_x="" id_y="" pw_x="" pw_y="" sub_x="" sub_y="" tried_home_button=0
+  local id_x="" id_y="" pw_x="" pw_y="" sub_x="" sub_y="" tried_home_button=0 proceed=1
   log "Login mode: enabled (credentials provided via environment)."
   log "Navigating to the login page..."
   adb shell am start -a android.intent.action.VIEW -d "$LOGIN_URL" com.android.chrome || true
@@ -920,20 +1220,45 @@ login_or_die() {
           adb_type "$LOGIN_EMAIL"
           sleep 2
         fi
-        adb shell input tap "$pw_x" "$pw_y" || true
-        sleep 2
-        adb_type "$LOGIN_PASSWORD"
-        sleep 2
-        log "Submitting the login form."
-        adb shell input tap "$sub_x" "$sub_y" || true
-        sleep 15
-        dismiss_save_password_prompt
-        dismiss_notifications_card || true
-        if verify_logged_in_dashboard; then
-          log "Login verified: dashboard loaded."
-          return 0
+        # The Gboard clipboard panel can pop up while typing and
+        # cover the lower half of the screen (run #8): hide the
+        # keyboard/panel, then re-find the form — the layout shifts
+        # when the keyboard hides, so the old coordinates may be
+        # stale.
+        dismiss_keyboard_panel || log "WARN: keyboard/panel may still be showing; the focus check decides."
+        refresh_login_fields || true
+        proceed=1
+        if ! tap_password_with_focus_check "$dump"; then
+          log "WARN: password field never gained focus (attempt $attempt); skipping submit."
+          proceed=0
         fi
-        log "WARN: dashboard not verified after submit (attempt $attempt)."
+        if [ "$proceed" -eq 1 ]; then
+          adb_type "$LOGIN_PASSWORD"
+          sleep 2
+          # The identifier must be exactly the login email before
+          # submit — if the password rode into it, this catches it.
+          if ! guard_identifier_exact "$dump"; then
+            log "WARN: identifier guard failed (attempt $attempt); skipping submit."
+            proceed=0
+          fi
+        fi
+        if [ "$proceed" -eq 1 ]; then
+          # One last panel dismissal before submit (the panel can
+          # cover the submit button too); refresh coordinates
+          # after it.
+          dismiss_keyboard_panel || true
+          refresh_login_fields || true
+          log "Submitting the login form."
+          adb shell input tap "$sub_x" "$sub_y" || true
+          sleep 15
+          dismiss_save_password_prompt
+          dismiss_notifications_card || true
+          if verify_logged_in_dashboard; then
+            log "Login verified: dashboard loaded."
+            return 0
+          fi
+          log "WARN: dashboard not verified after submit (attempt $attempt)."
+        fi
         ;;
       NOFIELDS*)
         log "Login form not found in the dump ($found; attempt $attempt)."
