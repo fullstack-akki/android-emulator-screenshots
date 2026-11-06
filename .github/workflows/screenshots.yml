@@ -3,8 +3,12 @@
 # Boots a REAL Android emulator on a GitHub-hosted Ubuntu runner, opens
 # mobile Chrome to the URL you choose, and uploads VERIFIED screenshots
 # as workflow artifacts. Manual trigger only (workflow_dispatch).
-# No login, no credentials, no data creation, no local Android Studio,
-# no Mac required on your side — GitHub's runners do the work.
+# Optional login: pass login_email and the password comes from the
+# KHETBOOK_DEMO_PASSWORD repository secret (never logged) — the run
+# then captures logged-in screens. Optional screens list: one verified
+# frame per "label|target" line instead of the settled+scrolled pair.
+# No local Android Studio, no Mac required on your side — GitHub's
+# runners do the work.
 #
 # Hardened the hard way (Nov 2026): three configs went green while
 # uploading useless frames, because the checks had holes. This workflow
@@ -75,6 +79,16 @@ on:
         required: false
         default: "34"
         type: string
+      login_email:
+        description: "Login email for the app (empty = no login; the password comes from the KHETBOOK_DEMO_PASSWORD repository secret)"
+        required: false
+        default: ""
+        type: string
+      screens:
+        description: "Screens to capture, one per line as label|url (or label|tap:voice for the floating voice assistant). Empty = settled+scrolled frames of url."
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -102,6 +116,13 @@ jobs:
 
       - name: Boot emulator and capture screenshots
         uses: reactivecircus/android-emulator-runner@v2.38.0
+        env:
+          # Login credentials: the email comes from the input, the
+          # password ONLY from the repo secret. Neither is echoed by
+          # the script; an empty email disables login entirely.
+          LOGIN_EMAIL: ${{ inputs.login_email }}
+          LOGIN_PASSWORD: ${{ secrets.KHETBOOK_DEMO_PASSWORD }}
+          SCREENS: ${{ inputs.screens }}
         with:
           api-level: ${{ inputs.api-level }}
           target: google_apis
