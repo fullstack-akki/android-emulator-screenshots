@@ -5,6 +5,22 @@
 # URL may also come from the CAPTURE_URL environment variable; default
 # is https://example.com.
 #
+# Optional LOGIN mode: when BOTH LOGIN_EMAIL and LOGIN_PASSWORD are
+# set (never logged, never echoed — the password arrives from a
+# CI secret), the script logs in to the app after Chrome launch
+# (identifier + password form) and verifies the logged-in dashboard
+# before any shot. With only one of the two set, login is skipped
+# and the run proceeds logged-out. A failed login exits 1 with a
+# diagnostic frame — a logged-out screen is never captured as if
+# it were logged in.
+#
+# Optional SCREENS mode: SCREENS is newline-separated "label|target"
+# lines; target is a full URL, or "tap:voice" for the floating voice
+# assistant (opened from the dashboard — it has no route). When set,
+# one verified settled frame is captured per screen (named
+# NN-label.png) instead of the settled+scrolled pair. Empty SCREENS
+# keeps the original single-URL behaviour (01-settled + 02-scrolled).
+#
 # Why the verification exists — three green runs produced useless
 # frames, each exposing a new hole in the previous check:
 #   Run #2 (Nov 2026): 01-settled.png completely black; 02-scrolled.png
@@ -57,12 +73,32 @@
 # Android Back press as the last resort before failing.
 #
 # The URL is passed as the first argument (or CAPTURE_URL); it is a
-# public page. Nothing is typed, nothing is submitted, no login.
+# public page. Without LOGIN_* it is never typed into and nothing is
+# submitted. With LOGIN_* set, the login form IS typed into (see the
+# login phase) — and only then.
 set -euo pipefail
 
 URL="${1:-${CAPTURE_URL:-https://example.com}}"
 OUT_DIR="screenshots"
 mkdir -p "$OUT_DIR"
+
+# Login credentials come from the environment ONLY (CI secret in
+# production). They are NEVER logged or echoed anywhere in this
+# script — not even the email. Only "login enabled/disabled" is
+# logged.
+LOGIN_EMAIL="${LOGIN_EMAIL:-}"
+LOGIN_PASSWORD="${LOGIN_PASSWORD:-}"
+# SCREENS: newline-separated "label|target" lines (see header).
+SCREENS="${SCREENS:-}"
+
+# APP_ORIGIN is the scheme+host of URL; LOGIN_URL / DASHBOARD_URL are
+# derived from it (the app's routes: /login is public, /dashboard is
+# the post-login landing page). CURRENT_URL is what gate C checks and
+# what refire_intent re-fires; it moves as the run navigates.
+APP_ORIGIN="$(printf '%s' "$URL" | sed -E 's#^(https?://[^/]+).*#\1#')"
+LOGIN_URL="$APP_ORIGIN/login"
+DASHBOARD_URL="$APP_ORIGIN/dashboard"
+CURRENT_URL="$URL"
 
 # ANR_RECOVERY_DONE: 1 once the single bounded ANR recovery has run
 # for the current shot (see ensure_no_anr). Reset to 0 by
@@ -512,12 +548,13 @@ ensure_no_anr() {
   return 1
 }
 
-# url_matches <tab-url>: 0 when the tab URL is the requested URL
+# url_matches <tab-url>: 0 when the tab URL is the CURRENT_URL
 # (scheme-insensitive, trailing slash ignored, sub-path/query/
 # fragment allowed — redirects and tracking params must not fail it).
+# CURRENT_URL moves as the run navigates (login, per-screen URLs).
 url_matches() {
   local tab="$1" norm_tab="" norm_url=""
-  norm_url="${URL#http://}"
+  norm_url="${CURRENT_URL#http://}"
   norm_url="${norm_url#https://}"
   norm_url="${norm_url%/}"
   norm_tab="${tab#http://}"
@@ -592,8 +629,8 @@ for t in targets:
 }
 
 refire_intent() {
-  log "Re-firing VIEW intent at $URL ..."
-  adb shell am start -a android.intent.action.VIEW -d "$URL" com.android.chrome || true
+  log "Re-firing VIEW intent at $CURRENT_URL ..."
+  adb shell am start -a android.intent.action.VIEW -d "$CURRENT_URL" com.android.chrome || true
   wait_for_chrome_foreground
   sleep 15
 }
@@ -602,6 +639,435 @@ do_swipe() {
   log "Scrolling down once..."
   adb shell input swipe 540 1600 540 700 300 || true
   sleep 5
+}
+
+# adb_type <text>: type text with `adb shell input text`, escaping
+# the two characters that command treats specially: % (the escape
+# introducer — a bare % corrupts the text) and space (typed as %s).
+# The login inputs are restricted by construction (email charset
+# letters/digits/+/@/. and an alphanumeric password), so no shell
+# metacharacters reach the device shell.
+adb_type() {
+  local text="$1"
+  text="${text//%/%%}"
+  text="${text// /%s}"
+  adb shell input text "$text" || true
+}
+
+# find_text_button <dumpfile> <exact-text>: print exactly one line:
+#   "TAP <x> <y>" when a node has that exact text or content-desc,
+#   "ABSENT" when the dump parses and has no such node,
+#   "UNPARSABLE" when the dump is not usable XML. The centre of the
+#   node's bounds is the tap point. Used for the homepage
+#   "લોગિન કરો" button, the save-password "Never" button, and the
+#   floating voice-assistant button (aria-label "Voice Assistant").
+find_text_button() {
+  python3 - "$1" "$2" <<'PYEOF'
+import sys, xml.etree.ElementTree as ET
+path = sys.argv[1]
+want = sys.argv[2]
+try:
+    with open(path, "rb") as fh:
+        data = fh.read()
+    if data.startswith(b"\xef\xbb\xbf"):
+        data = data[3:]
+    start = data.find(b"<?xml")
+    if start < 0:
+        start = data.find(b"<hierarchy")
+    if start < 0:
+        raise ValueError("no XML start marker")
+    end = data.rfind(b"</hierarchy>")
+    if end >= start:
+        data = data[: end + len(b"</hierarchy>")]
+    root = ET.fromstring(data[start:])
+except Exception as exc:
+    print("UNPARSABLE: %s" % exc, file=sys.stderr)
+    print("UNPARSABLE")
+    sys.exit(0)
+
+def center(bounds):
+    try:
+        a, b = bounds.split("][")
+        x1, y1 = a.lstrip("[").split(",")
+        x2, y2 = b.rstrip("]").split(",")
+        return ((int(x1) + int(x2)) // 2, (int(y1) + int(y2)) // 2)
+    except Exception:
+        return None
+
+for node in root.iter("node"):
+    if (node.get("text") or "") == want or (node.get("content-desc") or "") == want:
+        c = center(node.get("bounds", ""))
+        if c:
+            print("TAP %d %d" % c)
+            sys.exit(0)
+print("ABSENT")
+PYEOF
+}
+
+# find_login_fields <dumpfile>: print exactly one line on stdout:
+#   "FIELDS <id_x> <id_y> <pw_x> <pw_y> <sub_x> <sub_y>" when the
+#   identifier + password + submit controls are all found,
+#   "NOFIELDS <missing>" when the form is not fully present,
+#   "UNPARSABLE" when the dump is not usable XML.
+# Matching order (web content in Chrome's accessibility tree has no
+# stable resource-ids, so hints and order carry the weight):
+#   identifier — resource-id containing "identifier"/"username",
+#     else a node carrying the "email@example.com" placeholder,
+#     else the FIRST EditText on screen.
+#   password — resource-id containing "password", else an EditText
+#     with password="true", else the first EditText that is not the
+#     identifier.
+#   submit — exact text (or content-desc) "લોગિન કરો", else a Button
+#     whose text contains "લોગિન".
+find_login_fields() {
+  python3 - "$1" <<'PYEOF'
+import sys, xml.etree.ElementTree as ET
+path = sys.argv[1]
+try:
+    with open(path, "rb") as fh:
+        data = fh.read()
+    if data.startswith(b"\xef\xbb\xbf"):
+        data = data[3:]
+    start = data.find(b"<?xml")
+    if start < 0:
+        start = data.find(b"<hierarchy")
+    if start < 0:
+        raise ValueError("no XML start marker")
+    end = data.rfind(b"</hierarchy>")
+    if end >= start:
+        data = data[: end + len(b"</hierarchy>")]
+    root = ET.fromstring(data[start:])
+except Exception as exc:
+    print("UNPARSABLE: %s" % exc, file=sys.stderr)
+    print("UNPARSABLE")
+    sys.exit(0)
+
+def center(bounds):
+    try:
+        a, b = bounds.split("][")
+        x1, y1 = a.lstrip("[").split(",")
+        x2, y2 = b.rstrip("]").split(",")
+        return ((int(x1) + int(x2)) // 2, (int(y1) + int(y2)) // 2)
+    except Exception:
+        return None
+
+edits = [n for n in root.iter("node") if n.get("class") == "android.widget.EditText"]
+
+ident = None
+for node in edits:
+    rid = (node.get("resource-id") or "").lower()
+    if "identifier" in rid or "username" in rid:
+        ident = node
+        break
+if ident is None:
+    for node in edits:
+        t = (node.get("text") or "") + " " + (node.get("content-desc") or "")
+        if "email@example.com" in t:
+            ident = node
+            break
+if ident is None and edits:
+    ident = edits[0]
+
+pw = None
+for node in edits:
+    rid = (node.get("resource-id") or "").lower()
+    if "password" in rid:
+        pw = node
+        break
+if pw is None:
+    for node in edits:
+        if node.get("password") == "true":
+            pw = node
+            break
+if pw is None:
+    for node in edits:
+        if node is not ident:
+            pw = node
+            break
+
+submit = None
+for node in root.iter("node"):
+    if (node.get("text") or "") == "લોગિન કરો" or (node.get("content-desc") or "") == "લોગિન કરો":
+        submit = node
+        break
+if submit is None:
+    for node in root.iter("node"):
+        cls = node.get("class") or ""
+        if cls.endswith("Button") and "લોગિન" in (node.get("text") or ""):
+            submit = node
+            break
+
+missing = []
+if ident is None:
+    missing.append("identifier")
+if pw is None:
+    missing.append("password")
+if submit is None:
+    missing.append("submit")
+if missing:
+    print("NOFIELDS %s" % ",".join(missing))
+    sys.exit(0)
+
+ci = center(ident.get("bounds", ""))
+cp = center(pw.get("bounds", ""))
+cs = center(submit.get("bounds", ""))
+if not ci or not cp or not cs:
+    print("NOFIELDS no-bounds")
+    sys.exit(0)
+print("FIELDS %d %d %d %d %d %d" % (ci[0], ci[1], cp[0], cp[1], cs[0], cs[1]))
+PYEOF
+}
+
+# dismiss_save_password_prompt: Chrome may offer to save the password
+# after a successful login ("Save password?" bottom sheet). It would
+# cover the dashboard, so tap "Never" once if it is showing (or Back
+# once if there is no "Never" button). Best-effort only — always
+# returns 0; the dashboard verification after it is what decides.
+dismiss_save_password_prompt() {
+  local dump="$OUT_DIR/.savepw-dump.xml" tap=""
+  if ! fetch_ui_dump "$dump" 2>/dev/null; then
+    return 0
+  fi
+  if grep -q "Save password" "$dump"; then
+    tap="$(find_text_button "$dump" "Never" || true)"
+    case "$tap" in
+      TAP*)
+        set -- $tap
+        log "Save-password prompt showing; tapping 'Never' at $2,$3."
+        adb shell input tap "$2" "$3" || true
+        sleep 5
+        ;;
+      *)
+        log "Save-password prompt showing but no 'Never' button found; pressing Back once."
+        adb shell input keyevent 4 || true
+        sleep 5
+        ;;
+    esac
+  fi
+  return 0
+}
+
+# verify_logged_in_dashboard: 0 only when BOTH hold: a Chrome tab
+# holds the /dashboard URL (DevTools) and the UI dump carries a
+# logged-in dashboard marker ("ડેશબોર્ડ" nav label or the "નમસ્તે"
+# greeting). Up to 3 rounds; the caller decides on failure.
+verify_logged_in_dashboard() {
+  local round=1 dump="$OUT_DIR/.dashboard-dump.xml" saved_url="$CURRENT_URL"
+  CURRENT_URL="$DASHBOARD_URL"
+  while [ "$round" -le 3 ]; do
+    if verify_url_loaded; then
+      log "Dashboard URL verified in a Chrome tab."
+      if fetch_ui_dump "$dump" 2>/dev/null && grep -q "ડેશબોર્ડ\|નમસ્તે" "$dump"; then
+        log "Dashboard marker found in the UI dump (round $round)."
+        CURRENT_URL="$saved_url"
+        return 0
+      fi
+      log "WARN: dashboard URL OK but no dashboard marker in the dump (round $round)."
+    else
+      log "WARN: dashboard URL not verified yet (round $round)."
+    fi
+    sleep 10
+    round=$((round + 1))
+  done
+  CURRENT_URL="$saved_url"
+  return 1
+}
+
+# login_or_die: log in to the app with LOGIN_EMAIL / LOGIN_PASSWORD
+# (both must be set; the caller checks). 0 = the logged-in dashboard
+# is verified. 1 = login failed after bounded retries — the caller
+# exits 1 with a diagnostic frame; a logged-out screen is never
+# captured as if it were logged in. Credential values are NEVER
+# logged; only the presence/absence of the form and the verification
+# outcome appear in the log.
+login_or_die() {
+  local attempt=1 dump="$OUT_DIR/.login-dump.xml" found="" tap=""
+  local id_x="" id_y="" pw_x="" pw_y="" sub_x="" sub_y="" tried_home_button=0
+  log "Login mode: enabled (credentials provided via environment)."
+  log "Navigating to the login page..."
+  adb shell am start -a android.intent.action.VIEW -d "$LOGIN_URL" com.android.chrome || true
+  wait_for_chrome_foreground
+  sleep 15
+  # The promo card can cover the form — dismiss it before touching it.
+  dismiss_notifications_card || log "WARN: promo dismiss returned non-zero before login; continuing (the form check decides)."
+  while [ "$attempt" -le 3 ]; do
+    if ! fetch_ui_dump "$dump" 2>"$OUT_DIR/.login-dump.err"; then
+      cat "$OUT_DIR/.login-dump.err" 2>/dev/null || true
+      log "WARN: could not obtain a UI dump for the login form (attempt $attempt); retrying."
+      sleep 5
+      attempt=$((attempt + 1))
+      continue
+    fi
+    cat "$OUT_DIR/.login-dump.err" 2>/dev/null || true
+    found="$(find_login_fields "$dump" || true)"
+    case "$found" in
+      FIELDS*)
+        set -- $found
+        id_x="$2"; id_y="$3"; pw_x="$4"; pw_y="$5"; sub_x="$6"; sub_y="$7"
+        log "Login form found (attempt $attempt); typing credentials."
+        adb shell input tap "$id_x" "$id_y" || true
+        sleep 2
+        adb_type "$LOGIN_EMAIL"
+        sleep 2
+        # Verify the email landed in the field (re-dump; the value
+        # itself is never logged). One re-type if it did not.
+        if fetch_ui_dump "$dump" 2>/dev/null && grep -qF "$LOGIN_EMAIL" "$dump"; then
+          log "Identifier field shows the entered email."
+        else
+          log "WARN: identifier field does not show the email after typing; re-tapping and re-typing once."
+          adb shell input tap "$id_x" "$id_y" || true
+          sleep 2
+          adb_type "$LOGIN_EMAIL"
+          sleep 2
+        fi
+        adb shell input tap "$pw_x" "$pw_y" || true
+        sleep 2
+        adb_type "$LOGIN_PASSWORD"
+        sleep 2
+        log "Submitting the login form."
+        adb shell input tap "$sub_x" "$sub_y" || true
+        sleep 15
+        dismiss_save_password_prompt
+        dismiss_notifications_card || true
+        if verify_logged_in_dashboard; then
+          log "Login verified: dashboard loaded."
+          return 0
+        fi
+        log "WARN: dashboard not verified after submit (attempt $attempt)."
+        ;;
+      NOFIELDS*)
+        log "Login form not found in the dump ($found; attempt $attempt)."
+        if [ "$tried_home_button" -eq 0 ]; then
+          tried_home_button=1
+          log "Falling back to the homepage 'લોગિન કરો' button."
+          adb shell am start -a android.intent.action.VIEW -d "$URL" com.android.chrome || true
+          wait_for_chrome_foreground
+          sleep 10
+          if fetch_ui_dump "$dump" 2>/dev/null; then
+            tap="$(find_text_button "$dump" "લોગિન કરો" || true)"
+            case "$tap" in
+              TAP*)
+                set -- $tap
+                log "Tapping 'લોગિન કરો' at $2,$3."
+                adb shell input tap "$2" "$3" || true
+                sleep 10
+                ;;
+              *) log "WARN: 'લોગિન કરો' button not found on the homepage." ;;
+            esac
+          fi
+        fi
+        ;;
+      *)
+        log "WARN: login form dump unparsable (attempt $attempt; result: '$found'); retrying."
+        ;;
+    esac
+    sleep 5
+    attempt=$((attempt + 1))
+  done
+  log "Capturing a diagnostic frame of the failed login screen..."
+  adb exec-out screencap -p > "$OUT_DIR/00-last-failed-frame-login.png" || true
+  if [ ! -s "$OUT_DIR/00-last-failed-frame-login.png" ]; then
+    rm -f "$OUT_DIR/00-last-failed-frame-login.png" 2>/dev/null || true
+  else
+    log "Diagnostic saved: 00-last-failed-frame-login.png"
+  fi
+  log "ERROR: login failed; refusing to capture logged-out screens as if logged in."
+  return 1
+}
+
+# navigate_to <url>: open the URL in Chrome (VIEW intent), wait for
+# the foreground, and settle (SPA navigations are fast; 20s).
+navigate_to() {
+  local target="$1"
+  CURRENT_URL="$target"
+  log "Navigating to $target ..."
+  adb shell am start -a android.intent.action.VIEW -d "$target" com.android.chrome || true
+  wait_for_chrome_foreground
+  sleep 20
+}
+
+# open_voice_assistant: tap the floating voice-assistant button
+# (aria-label "Voice Assistant") and verify the panel opened (its
+# Gujarati title "વૉઇસ સહાયક" or tap hint in the dump). The assistant
+# has no route — this tap is the only way in. 0 = panel open.
+open_voice_assistant() {
+  local dump="$OUT_DIR/.voice-dump.xml" tap=""
+  if ! fetch_ui_dump "$dump" 2>"$OUT_DIR/.voice-dump.err"; then
+    cat "$OUT_DIR/.voice-dump.err" 2>/dev/null || true
+    log "ERROR: could not obtain a UI dump to find the voice assistant button."
+    return 1
+  fi
+  cat "$OUT_DIR/.voice-dump.err" 2>/dev/null || true
+  tap="$(find_text_button "$dump" "Voice Assistant" || true)"
+  case "$tap" in
+    TAP*)
+      set -- $tap
+      log "Tapping the floating voice assistant button at $2,$3."
+      adb shell input tap "$2" "$3" || true
+      sleep 10
+      if fetch_ui_dump "$dump" 2>/dev/null && grep -q "વૉઇસ સહાયક\|બોલવા માટે ટેપ કરો" "$dump"; then
+        log "Voice assistant panel is open."
+        return 0
+      fi
+      log "ERROR: voice assistant panel did not open (no panel title in the dump)."
+      return 1
+      ;;
+    *)
+      log "ERROR: voice assistant button not found (result: '$tap')."
+      return 1
+      ;;
+  esac
+}
+
+# capture_screen <label> <target> <outfile>: navigate to one screen
+# and capture one verified settled frame. target is a full URL, or
+# "tap:voice" (dashboard + floating-button tap). The promo card is
+# dismissed before the shot; the shot itself reuses the settled
+# gates (foreground + ANR + URL + pixel). 0 = frame captured.
+capture_screen() {
+  local label="$1" target="$2" outfile="$3"
+  if [ "$target" = "tap:voice" ]; then
+    navigate_to "$DASHBOARD_URL"
+    if ! open_voice_assistant; then
+      log "ERROR: could not open the voice assistant for screen '$label'."
+      return 1
+    fi
+    CURRENT_URL="$DASHBOARD_URL"
+  else
+    navigate_to "$target"
+  fi
+  dismiss_promo_or_die "promo-$label"
+  capture_verified_frame "$OUT_DIR/$outfile" "$label" 1
+}
+
+# capture_screens: one verified settled frame per SCREENS line
+# ("label|target", # comments and blank lines skipped). A bad line
+# or a failed screen fails the run — a missing screen must never
+# pass silently as a shorter set.
+capture_screens() {
+  local i=0 line="" label="" target="" outfile=""
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -z "$line" ] && continue
+    case "$line" in \#*) continue;; esac
+    label="${line%%|*}"
+    target="${line#*|}"
+    if [ -z "$label" ] || [ -z "$target" ] || [ "$label" = "$line" ]; then
+      log "ERROR: bad SCREENS line (want 'label|target'): '$line'"
+      return 1
+    fi
+    i=$((i + 1))
+    outfile="$(printf '%02d-%s.png' "$i" "$label")"
+    log "Screen $i ($label): target $target"
+    if ! capture_screen "$label" "$target" "$outfile"; then
+      return 1
+    fi
+  done <<<"$SCREENS"
+  if [ "$i" -lt 1 ]; then
+    log "ERROR: SCREENS was set but contained no usable lines."
+    return 1
+  fi
+  log "Captured $i screen(s)."
+  return 0
 }
 
 # fetch_ui_dump <outfile>: write the current UI hierarchy XML to
@@ -907,6 +1373,35 @@ capture_verified_frame() {
   return 1
 }
 
+# Chrome's notifications promo card ("Chrome notifications make
+# things easier", "No thanks" / "Continue") is not suppressed by
+# the --disable-fre flags on the google_apis API 34 image: run
+# 41847287396 went green with the card covering the middle of the
+# page. Dismiss it before any shot is accepted — a card over the
+# page must never reach a listing frame.
+# dismiss_promo_or_die [label]: dismiss the notifications promo card;
+# on failure capture a diagnostic frame (named for the label) and exit
+# 1 — an obscured frame must never be accepted.
+# (Defined here with the other helpers, not in the main flow below:
+# capture_screen calls it, and a definition sitting after the first
+# main-flow command would be easy to reorder past its first use.)
+dismiss_promo_or_die() {
+  local tag="${1:-promo-card}"
+  if dismiss_notifications_card; then
+    return 0
+  fi
+  log "Capturing a diagnostic frame of the stuck screen..."
+  adb exec-out screencap -p > "$OUT_DIR/00-last-failed-frame-$tag.png" || true
+  if [ ! -s "$OUT_DIR/00-last-failed-frame-$tag.png" ]; then
+    rm -f "$OUT_DIR/00-last-failed-frame-$tag.png" 2>/dev/null || true
+    log "WARN: diagnostic screencap was empty; no diagnostic frame saved."
+  else
+    log "Diagnostic saved: 00-last-failed-frame-$tag.png"
+  fi
+  log "ERROR: notifications promo card could not be dismissed; refusing to capture obscured frames."
+  exit 1
+}
+
 wait_for_boot
 keep_display_awake
 wait_for_launcher
@@ -955,42 +1450,29 @@ wait_for_chrome_foreground
 log "Page settle: sleeping 45s for the page to render..."
 sleep 45
 
-# Chrome's notifications promo card ("Chrome notifications make
-# things easier", "No thanks" / "Continue") is not suppressed by
-# the --disable-fre flags on the google_apis API 34 image: run
-# 41847287396 went green with the card covering the middle of the
-# page. Dismiss it before any shot is accepted — a card over the
-# page must never reach a listing frame.
-# dismiss_promo_or_die: dismiss the notifications promo card; on
-# failure capture a diagnostic frame and exit 1 — an obscured frame
-# must never be accepted.
-dismiss_promo_or_die() {
-  if dismiss_notifications_card; then
-    return 0
-  fi
-  log "Capturing a diagnostic frame of the stuck screen..."
-  adb exec-out screencap -p > "$OUT_DIR/00-last-failed-frame-promo-card.png" || true
-  if [ ! -s "$OUT_DIR/00-last-failed-frame-promo-card.png" ]; then
-    rm -f "$OUT_DIR/00-last-failed-frame-promo-card.png" 2>/dev/null || true
-    log "WARN: diagnostic screencap was empty; no diagnostic frame saved."
-  else
-    log "Diagnostic saved: 00-last-failed-frame-promo-card.png"
-  fi
-  log "ERROR: notifications promo card could not be dismissed; refusing to capture obscured frames."
-  exit 1
-}
-
 dismiss_promo_or_die
 # The card can appear AFTER the first check (run #6's failed frame
 # still showed it) — re-run the dismiss immediately before the
 # first shot so a late-appearing card is caught, not captured.
 dismiss_promo_or_die
 
-capture_verified_frame "$OUT_DIR/01-settled.png" "settled" 1
+# Login phase (only when BOTH credentials are set — see login_or_die).
+if [ -n "$LOGIN_EMAIL" ] && [ -n "$LOGIN_PASSWORD" ]; then
+  login_or_die || exit 1
+elif [ -n "$LOGIN_EMAIL" ] || [ -n "$LOGIN_PASSWORD" ]; then
+  log "WARN: only one of LOGIN_EMAIL / LOGIN_PASSWORD is set; skipping login (both are required)."
+fi
 
-do_swipe
+if [ -n "$SCREENS" ]; then
+  # Multi-screen mode: one verified settled frame per SCREENS line.
+  capture_screens || exit 1
+else
+  capture_verified_frame "$OUT_DIR/01-settled.png" "settled" 1
 
-capture_verified_frame "$OUT_DIR/02-scrolled.png" "scrolled" 0
+  do_swipe
+
+  capture_verified_frame "$OUT_DIR/02-scrolled.png" "scrolled" 0
+fi
 
 log "Screenshots (verified frames):"
 ls -la "$OUT_DIR"
