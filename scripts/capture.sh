@@ -15,7 +15,9 @@
 # it were logged in.
 #
 # Optional SCREENS mode: SCREENS is newline-separated "label|target"
-# lines; target is a full URL, or "tap:voice" for the floating voice
+# lines (or ';'-separated on one line, for GitHub's single-line
+# workflow_dispatch input, which collapses pasted newlines to spaces);
+# target is a full URL, or "tap:voice" for the floating voice
 # assistant (opened from the dashboard — it has no route). When set,
 # one verified settled frame is captured per screen (named
 # NN-label.png) instead of the settled+scrolled pair. Empty SCREENS
@@ -1371,6 +1373,12 @@ capture_screen() {
 # pass silently as a shorter set.
 capture_screens() {
   local i=0 line="" label="" target="" outfile=""
+  # GitHub's workflow_dispatch form is a single-line input: a pasted
+  # multi-line list arrives space-joined, so ';' is also accepted as
+  # a line separator (no label or URL here contains ';'). Newlines
+  # keep working, so API dispatches are unaffected.
+  local screens_normalized
+  screens_normalized="$(printf '%s' "$SCREENS" | tr ';' '\n')"
   while IFS= read -r line || [ -n "$line" ]; do
     [ -z "$line" ] && continue
     case "$line" in \#*) continue;; esac
@@ -1380,13 +1388,22 @@ capture_screens() {
       log "ERROR: bad SCREENS line (want 'label|target'): '$line'"
       return 1
     fi
+    # A target with a space is never a valid URL or tap:voice — it
+    # means a pasted multi-line list was collapsed to spaces by a
+    # single-line form. Fail fast here, not after boot + login.
+    case "$target" in
+      *\ * )
+        log "ERROR: bad SCREENS target (contains a space — use ';' between screens, not spaces): '$target'"
+        return 1
+        ;;
+    esac
     i=$((i + 1))
     outfile="$(printf '%02d-%s.png' "$i" "$label")"
     log "Screen $i ($label): target $target"
     if ! capture_screen "$label" "$target" "$outfile"; then
       return 1
     fi
-  done <<<"$SCREENS"
+  done <<<"$screens_normalized"
   if [ "$i" -lt 1 ]; then
     log "ERROR: SCREENS was set but contained no usable lines."
     return 1
